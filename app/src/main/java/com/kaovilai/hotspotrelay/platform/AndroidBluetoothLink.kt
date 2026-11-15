@@ -59,6 +59,8 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
 
     private val adapter: BluetoothAdapter? get() = manager?.adapter
 
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     @Volatile
     private var hidDevice: BluetoothHidDevice? = null
 
@@ -220,6 +222,9 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             // Registration lands in onAppStatusChanged; the caller retries.
             return PairingModeResult.NOT_READY
         }
+        // Bound how long a pairing-only registration may keep the phone's HID
+        // host disabled; the service re-registers on demand during attempts.
+        mainHandler.postDelayed({ unregisterHid() }, PAIRING_REGISTRATION_TTL_MS)
         return PairingModeResult.READY
     }
 
@@ -306,6 +311,9 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             }
 
         private val MAC_ADDRESS = Regex("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+        /** How long a pairing-mode registration may keep the HID host borrowed. */
+        private const val PAIRING_REGISTRATION_TTL_MS = 120_000L
 
         /** Standard boot-keyboard HID report descriptor; the iPhone just needs a valid HID device. */
         private val KEYBOARD_DESCRIPTOR: ByteArray = hexBytes(

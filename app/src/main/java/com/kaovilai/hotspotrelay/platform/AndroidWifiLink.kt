@@ -263,6 +263,13 @@ class AndroidWifiLink(private val context: Context) {
             return
         }
 
+        // Last-moment guard: never pull the phone off a network it is happily on.
+        val current = association()
+        if (current.associated && current.ssid != null && current.ssid != ssid) {
+            Log.i(TAG, "not requesting hotspot while associated with ${current.ssid}")
+            return
+        }
+
         // Obsolete requests for other targets must not keep running.
         cancelRequests(exceptSsid = ssid)
 
