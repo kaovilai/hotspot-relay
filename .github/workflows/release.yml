@@ -1,0 +1,84 @@
+name: Release
+
+# Pushing a tag like v1.2.0 builds the signed APK and publishes it as a GitHub
+# Release, which is what Obtainium tracks. Bump versionCode/versionName in
+# app/build.gradle.kts before tagging: Obtainium compares versionCode.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Ensure compileSdk platform is installed
+        run: |
+          SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          for pkg in "platforms;android-37.0" "platforms;android-37"; do
+            "$SDKMANAGER" "$pkg" > /dev/null 2>&1 && break
+          done
+          "$SDKMANAGER" "build-tools;37.0.0" > /dev/null 2>&1 || true
+          if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-37" ] && \
+             [ ! -d "$ANDROID_SDK_ROOT/platforms/android-37.0" ]; then
+            echo "android-37 platform not available on this runner" >&2
+            exit 1
+          fi
+
+      - name: Check tag matches versionName
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gradle_version=$(grep -E 'versionName = ' app/build.gradle.kts | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          echo "tag=$version versionName=$gradle_version"
+          if [ "$version" != "$gradle_version" ]; then
+            echo "tag v$version does not match versionName $gradle_version; bump app/build.gradle.kts" >&2
+            exit 1
+          fi
+
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.HOTSPOT_RELAY_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "HOTSPOT_RELAY_KEYSTORE_B64 secret is missing; cannot sign" >&2
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Test and build signed APK
+        env:
+          HOTSPOT_RELAY_KEYSTORE: ${{ runner.temp }}/release.jks
+          HOTSPOT_RELAY_KEYSTORE_PASSWORD: ${{ secrets.HOTSPOT_RELAY_KEYSTORE_PASSWORD }}
+          HOTSPOT_RELAY_KEY_ALIAS: ${{ secrets.HOTSPOT_RELAY_KEY_ALIAS }}
+          HOTSPOT_RELAY_KEY_PASSWORD: ${{ secrets.HOTSPOT_RELAY_KEY_PASSWORD }}
+        run: ./gradlew test assembleRelease --no-daemon
+
+      - name: Name the asset
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cp app/build/outputs/apk/release/app-release.apk "HotspotRelay-${version}.apk"
+          echo "ASSET=HotspotRelay-${version}.apk" >> "$GITHUB_ENV"
+
+      - name: Verify signature
+        run: |
+          "$ANDROID_SDK_ROOT/build-tools/37.0.0/apksigner" verify --print-certs "$ASSET"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ASSET" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
