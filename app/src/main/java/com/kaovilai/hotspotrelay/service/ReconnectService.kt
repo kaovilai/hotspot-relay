@@ -166,15 +166,14 @@ class ReconnectService : Service() {
             lastNotificationMessage = message
         }
 
-        // Windows in which there is nothing left to trigger. Entering one of these
-        // drops the HID link: joined, moved to another Wi-Fi, or blocked. Using the
-        // target phase (not "was trying") keeps this from tearing down a fresh
-        // Bluetooth retry right after the link drops.
-        if (state.phase in RELEASE_TRIGGER_PHASES && lastPhase !in RELEASE_TRIGGER_PHASES) {
+        // Windows in which there is nothing left to trigger. Any transition into
+        // one of them drops the HID link, and every terminal phase except CONNECTED
+        // also cancels live hotspot requests. Comparing with lastPhase (not "entering
+        // the set") matters: CONNECTED -> BLOCKED must still clean up.
+        if (state.phase in RELEASE_TRIGGER_PHASES && lastPhase != state.phase) {
             bluetooth.disconnectTrigger()
-            // Keep the request alive on CONNECTED: its 30s hold is what hands the
-            // association over to the system's own auto-join. Cancel it only when
-            // we stop caring (other Wi-Fi) or cannot proceed (blocked).
+            // On CONNECTED the request's 30s hold is what hands the association to
+            // the system's auto-join, so it is left alone there.
             if (state.phase != Phase.CONNECTED) wifi.cancelHotspotRequests()
         }
         lastPhase = state.phase
