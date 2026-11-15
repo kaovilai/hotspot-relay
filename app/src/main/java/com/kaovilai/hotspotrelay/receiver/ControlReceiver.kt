@@ -102,6 +102,15 @@ class ControlReceiver : BroadcastReceiver() {
             ACTION_STOP -> Parsed(SettingsCommand.Stop)
 
             ACTION_SET_ROTATE_AFTER -> {
+                // Reject a present-but-unparseable alias instead of falling back to
+                // the other one: `value=invalid attempts=2` is a caller bug, not a
+                // request to use 2.
+                if (intent.hasExtra("value") && intExtra(intent, "value") == null) {
+                    return Parsed(error = "SET_ROTATE_AFTER 'value' must be a number")
+                }
+                if (intent.hasExtra("attempts") && intExtra(intent, "attempts") == null) {
+                    return Parsed(error = "SET_ROTATE_AFTER 'attempts' must be a number")
+                }
                 val value = intExtra(intent, "value") ?: intExtra(intent, "attempts")
                 if (value == null) {
                     Parsed(error = "SET_ROTATE_AFTER needs a numeric value or attempts")
