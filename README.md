@@ -63,8 +63,10 @@ Or grab the APK from [Releases](../../releases/latest).
 ### On the Android phone
 
 1. Open the app, tap **Grant permissions** and allow Nearby devices, Location,
-   and notifications. Location is only needed to read the current Wi-Fi name —
-   Android redacts SSIDs otherwise.
+   and notifications. The Nearby devices permission only exists on Android 12+;
+   on Android 10–11 the equivalent is **Location**, which scanning also needs
+   there. Location is also what lets the app read the current Wi-Fi name —
+   without it Android redacts SSIDs.
 2. Enable Bluetooth, then tap **Pair with iPhone (keyboard mode)**. The first tap
    registers the phone as a keyboard; if it says "Try again in a second", tap
    once more — the phone becomes discoverable and advertises a keyboard. On the
@@ -75,9 +77,10 @@ Or grab the APK from [Releases](../../releases/latest).
    Bluetooth name (or MAC), **hotspot SSID** and **hotspot password**.
    **Pick paired** lists the phones already bonded to this device; **Scan
    nearby** finds discoverable Bluetooth devices (needs the Nearby devices
-   permission and a discoverable iPhone); **Use current Wi-Fi** fills the SSID
-   when you are already on that hotspot. The SSID is exactly the iPhone's device
-   name — **Settings → General → About → Name** (on a phone named
+   permission on Android 12+ or Location on 10–11, and a discoverable iPhone);
+   **Use current Wi-Fi** fills the SSID when you are already on that hotspot.
+   The SSID is exactly the iPhone's device name — **Settings → General → About
+   → Name** (on a phone named
    `Alice's iPhone` the hotspot is `Alice's iPhone`, not
    `Alice's iPhone's iPhone`). Use **↑ / ↓** to set priority and the switch to
    enable or disable an entry.
