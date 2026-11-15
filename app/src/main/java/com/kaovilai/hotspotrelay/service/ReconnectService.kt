@@ -19,7 +19,6 @@ import com.kaovilai.hotspotrelay.MainActivity
 import com.kaovilai.hotspotrelay.R
 import com.kaovilai.hotspotrelay.core.BlockReason
 import com.kaovilai.hotspotrelay.core.EngineAction
-import com.kaovilai.hotspotrelay.core.LinkStatus
 import com.kaovilai.hotspotrelay.core.Phase
 import com.kaovilai.hotspotrelay.core.ReconnectEngine
 import com.kaovilai.hotspotrelay.core.TargetRotation
@@ -73,7 +72,6 @@ class ReconnectService : Service() {
     private var lastTargetId: String? = null
     /** Attempts issued to the current target; drives rotation. */
     private var attemptsOnTarget = 0
-    private var lastLinkStatus: LinkStatus = LinkStatus.DISCONNECTED
     private var lastNotificationMessage: String? = null
 
     override fun onCreate() {
@@ -189,29 +187,28 @@ class ReconnectService : Service() {
             )
             action = engine.onTick(snapshot)
 
-            // Establishing the Bluetooth link is progress: the hotspot handoff
-            // should not be charged against the same per-target budget, or a
-            // rotate-after-1 setup would abandon the phone right at that point.
-            if (bt.link == LinkStatus.CONNECTED && lastLinkStatus != LinkStatus.CONNECTED) {
-                attemptsOnTarget = 0
-            }
-            lastLinkStatus = bt.link
-
             val notPaired = action is EngineAction.Blocked &&
                 action.reason == BlockReason.IPHONE_NOT_PAIRED
             val attemptDue = action == EngineAction.ConnectBluetooth ||
                 action == EngineAction.ConnectHotspot
-            // The engine's own failure count is not a per-target attempt counter
-            // (it resets whenever the link changes). Count the attempts we actually
-            // issued to this target ourselves, and rotate only when a new attempt is
-            // due so a target is never abandoned mid-connect.
-            val exhausted = attemptDue && attemptsOnTarget >= settings.rotateAfterAttempts
+            // The engine's failure count is not a per-target attempt counter (it
+            // resets whenever the link changes), so count the requests we issued.
+            // A Bluetooth attempt is the start of a cycle and may rotate at N; a
+            // hotspot request gets one extra slot so the handoff that follows a
+            // successful trigger is never abandoned. Flapping links keep adding to
+            // the counter, so a phone that connects but never yields a hotspot
+            // still hands over eventually.
+            val neededAttempts = if (action == EngineAction.ConnectBluetooth) {
+                settings.rotateAfterAttempts
+            } else {
+                settings.rotateAfterAttempts + 1
+            }
+            val exhausted = attemptDue && attemptsOnTarget >= neededAttempts
 
             if ((notPaired || exhausted) && rotations < targets.lastIndex) {
                 rotation.advance(targets)
                 engine.reset()
                 attemptsOnTarget = 0
-                lastLinkStatus = LinkStatus.DISCONNECTED
                 rotations++
                 target = rotation.current(targets) ?: target
                 continue

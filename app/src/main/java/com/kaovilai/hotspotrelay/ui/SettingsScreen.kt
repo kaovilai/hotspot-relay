@@ -123,7 +123,7 @@ fun SettingsScreen(store: SettingsStore) {
         // Keep Android's suggestions in sync with edited credentials; otherwise the
         // system would keep auto-joining with the old password.
         val wifi = AndroidWifiLink(context)
-        stored.targets.filter { it.isComplete }
+        stored.targets.filter { it.enabled && it.isComplete }
             .forEach { wifi.ensureSuggestion(it.ssid, it.password) }
         return stored
     }
