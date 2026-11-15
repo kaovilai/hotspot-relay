@@ -133,7 +133,7 @@ and save.
 ## How it decides
 
 `ReconnectEngine` is plain Kotlin with no Android imports, so every rule is
-unit-tested (`./gradlew testDebugUnitTest`, 38 tests). Each tick:
+unit-tested (`./gradlew testDebugUnitTest`, 49 tests). Each tick:
 
 | World state | Action |
 | --- | --- |
@@ -167,7 +167,7 @@ adb shell am broadcast -n com.kaovilai.hotspotrelay/.receiver.ControlReceiver \
 
 | Action | Extras | Effect |
 | --- | --- | --- |
-| `…action.SET_ENABLED` | `id` \| `ssid` \| `label` \| `index`, `enabled` (bool) | Enable/disable one iPhone |
+| `…action.SET_ENABLED` | `id` \| `ssid` \| `label` \| `index`, `enabled` (bool, required) | Enable/disable one iPhone; its Wi-Fi suggestion is registered or removed to match |
 | `…action.MOVE` | selector, `to` (0-based) or `delta` (+1/−1) | Reorder one iPhone; `delta` moves it relative to its position |
 | `…action.SET_ORDER` | `order` = comma-separated SSIDs/labels/ids | Full reorder; unlisted entries are appended |
 | `…action.SET_ROTATE_AFTER` | `value` (1–10) | Rotation limit; `1` = round-robin |
@@ -177,15 +177,23 @@ adb shell am broadcast -n com.kaovilai.hotspotrelay/.receiver.ControlReceiver \
 Rules:
 
 - Exactly one selector extra is needed (`id` > `ssid` > `label` > `index`).
+- Malformed commands are rejected with `ok=false`: a missing `enabled`, a
+  non-boolean `enabled`, a non-numeric `to`/`delta`/`index`/`value`, or `MOVE`
+  without either `to` or `delta`. The app never guesses a default.
 - Every command answers with JSON in the ordered-broadcast result (`state`, `ok`,
   `message`) and also emits `com.kaovilai.hotspotrelay.action.STATE_CHANGED`
   with the same extras, so an automation can listen for the new state.
+- `START`/`STOP` settle asynchronously, so they emit a **second** `STATE_CHANGED`
+  once the service has actually started or stopped (immediately if it was
+  already in the requested state, at most ~5 s otherwise). Wait for that one
+  when you need the final `running` value.
 - State JSON contains `running`, `rotateAfterAttempts`, and per-target
   `index/id/label/name/selector/ssid/enabled/complete`. **Passwords are never
   exposed, and commands cannot change credentials, SSIDs or Bluetooth
   selectors** — that stays in the app UI.
 - `START` may be refused by Android when sent from the background
-  (foreground-service launch restriction); the response message says so.
+  (foreground-service launch restriction); the response then has `ok=false` and
+  a message saying so.
 - The receiver is exported by necessity (Tasker cannot hold a signature
   permission), so any app can toggle/reorder/start/stop. None of these actions
   can read secrets or add networks.

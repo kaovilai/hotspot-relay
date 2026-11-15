@@ -64,6 +64,7 @@ import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
 import com.kaovilai.hotspotrelay.platform.PairingModeResult
 import com.kaovilai.hotspotrelay.platform.SuggestionOutcome
+import com.kaovilai.hotspotrelay.platform.SuggestionSync
 import com.kaovilai.hotspotrelay.service.ReconnectService
 import com.kaovilai.hotspotrelay.service.ServiceStatus
 
@@ -82,18 +83,30 @@ fun SettingsScreen(store: SettingsStore) {
     var tickSeconds by rememberSaveable { mutableStateOf((saved.tickIntervalMs / 1000).toString()) }
     var autoStartOnBoot by rememberSaveable { mutableStateOf(saved.autoStartOnBoot) }
     var revealed by remember { mutableStateOf(setOf<String>()) }
+    // The persisted values the form was last synced with. Comparing against this
+    // rather than against `saved` means an external change (Tasker, adb) does not
+    // look like a local edit: it can be adopted while the form is untouched, and
+    // Save cannot silently revert it.
+    var synced by remember { mutableStateOf(saved) }
 
-    val dirty = rows != saved.targets ||
-        rotateAfter != saved.rotateAfterAttempts.toString() ||
-        tickSeconds != (saved.tickIntervalMs / 1000).toString() ||
-        autoStartOnBoot != saved.autoStartOnBoot
+    val dirty = rows != synced.targets ||
+        rotateAfter != synced.rotateAfterAttempts.toString() ||
+        tickSeconds != (synced.tickIntervalMs / 1000).toString() ||
+        autoStartOnBoot != synced.autoStartOnBoot
 
     // Settings can also change from the external control receiver (Tasker, adb);
     // reflect those, but never clobber in-progress edits.
-    LaunchedEffect(saved.targets, saved.rotateAfterAttempts, dirty) {
-        if (!dirty) {
+    LaunchedEffect(saved) {
+        val untouched = rows == synced.targets &&
+            rotateAfter == synced.rotateAfterAttempts.toString() &&
+            tickSeconds == (synced.tickIntervalMs / 1000).toString() &&
+            autoStartOnBoot == synced.autoStartOnBoot
+        if (untouched) {
+            synced = saved
             rows = saved.targets
             rotateAfter = saved.rotateAfterAttempts.toString()
+            tickSeconds = (saved.tickIntervalMs / 1000).toString()
+            autoStartOnBoot = saved.autoStartOnBoot
         }
     }
 
@@ -116,24 +129,16 @@ fun SettingsScreen(store: SettingsStore) {
                 autoStartOnBoot = autoStartOnBoot,
             )
         }
-        // Reconcile suggestions: a deleted or cleared entry's SSID would
-        // otherwise stay auto-joined forever. Removal is API 30+ (enumeration
-        // is unavailable before that) and silent if there is nothing to remove.
-        val keepSsids = stored.targets.filter { it.enabled && it.isComplete }
-            .map { it.ssid }.toSet()
-        val stale = saved.targets.map { it.ssid }
-            .filter { it.isNotBlank() && it !in keepSsids }.toSet()
-        stale.forEach { ssid -> runCatching { AndroidWifiLink(context).forgetSuggestion(ssid) } }
+        // Keep Android's suggestions in sync: a deleted, cleared or disabled
+        // entry must stop being auto-joined, and edited credentials must be
+        // re-registered or the system keeps using the old password.
+        SuggestionSync.reconcile(context, saved, stored)
 
+        synced = stored
         rows = stored.targets
         rotateAfter = stored.rotateAfterAttempts.toString()
         tickSeconds = (stored.tickIntervalMs / 1000).toString()
         autoStartOnBoot = stored.autoStartOnBoot
-        // Keep Android's suggestions in sync with edited credentials; otherwise the
-        // system would keep auto-joining with the old password.
-        val wifi = AndroidWifiLink(context)
-        stored.targets.filter { it.enabled && it.isComplete }
-            .forEach { wifi.ensureSuggestion(it.ssid, it.password) }
         return stored
     }
 

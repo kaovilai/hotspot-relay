@@ -12,7 +12,13 @@ import com.kaovilai.hotspotrelay.core.TargetSelector
 import com.kaovilai.hotspotrelay.data.AppSettings
 import com.kaovilai.hotspotrelay.data.SettingsStateJson
 import com.kaovilai.hotspotrelay.data.SettingsStore
+import com.kaovilai.hotspotrelay.platform.SuggestionSync
 import com.kaovilai.hotspotrelay.service.ReconnectService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * External control surface for Tasker, adb and other automation.
@@ -27,7 +33,8 @@ import com.kaovilai.hotspotrelay.service.ReconnectService
  *
  * Every command answers with the resulting state JSON as the ordered-broadcast
  * result data (`state` extra, `ok`, `message`) and also emits
- * [ACTION_STATE_CHANGED], which an automation can listen for. Commands can only
+ * [ACTION_STATE_CHANGED], which an automation can listen for. Malformed commands
+ * are rejected (`ok=false`) instead of being guessed at. Commands can only
  * toggle, reorder, change the rotation limit, and start/stop the loop; they can
  * never read or change SSIDs, passwords or Bluetooth selectors.
  */
@@ -38,73 +45,155 @@ class ControlReceiver : BroadcastReceiver() {
         if (!action.startsWith(ACTION_PREFIX)) return
 
         val store = SettingsStore.get(context)
-        val settings = store.settings.value
-        val command = commandFor(action, intent, settings)
+        val before = store.settings.value
+        val parsed = parseCommand(action, intent, before)
+        if (parsed.error != null) {
+            respond(context, before, ok = false, message = parsed.error)
+            return
+        }
+        val command = parsed.command
         if (command == null) {
-            respond(context, settings, ok = false, message = "unsupported command: $action")
+            respond(context, before, ok = false, message = "unsupported command: $action")
             return
         }
 
-        val outcome = SettingsCommands.apply(settings, command)
-        if (outcome.settings != settings) {
-            store.update { outcome.settings }
+        val outcome = SettingsCommands.apply(before, command)
+        val after = if (outcome.settings != before) {
+            val stored = store.update { outcome.settings }
+            // Keep Android's network suggestions in step with the new state, the
+            // same way the settings screen does: a disabled or removed iPhone
+            // must stop being auto-joined, and a re-enabled one is re-registered.
+            SuggestionSync.reconcile(context, before, stored)
+            stored
+        } else {
+            before
         }
 
+        var ok = outcome.ok
         var message = outcome.message
         when (outcome.serviceAction) {
             CommandOutcome.ServiceAction.START -> {
                 // Android 12+ may refuse a foreground-service start from a
                 // background broadcast; report that instead of pretending.
                 val started = runCatching { ReconnectService.start(context) }.isSuccess
-                if (!started) message = "$message (blocked by Android; open the app to start)"
+                if (!started) {
+                    ok = false
+                    message = "$message (blocked by Android; open the app to start)"
+                }
             }
 
             CommandOutcome.ServiceAction.STOP -> ReconnectService.stop(context)
             null -> Unit
         }
 
-        respond(context, store.settings.value, outcome.ok, message)
+        respond(context, after, ok, message)
+
+        // START/STOP settle asynchronously, so the snapshot above can still show
+        // the previous `running` value. Publish the settled state as a second
+        // STATE_CHANGED once the service actually flips, so listeners need not
+        // poll.
+        if (outcome.serviceAction != null) {
+            publishSettledState(context, ok, message, wantRunning = outcome.serviceAction == CommandOutcome.ServiceAction.START)
+        }
     }
 
-    private fun commandFor(
-        action: String,
-        intent: Intent,
-        settings: AppSettings,
-    ): SettingsCommand? = when (action) {
-        ACTION_QUERY -> SettingsCommand.Query
-        ACTION_START -> SettingsCommand.Start
-        ACTION_STOP -> SettingsCommand.Stop
-        ACTION_SET_ROTATE_AFTER -> SettingsCommand.SetRotateAfter(
-            intExtra(intent, "value") ?: intExtra(intent, "attempts")
-                ?: settings.rotateAfterAttempts,
-        )
-
-        ACTION_SET_ENABLED -> selectorFrom(intent)?.let { selector ->
-            SettingsCommand.SetEnabled(selector, enabledFrom(intent))
-        }
-
-        ACTION_MOVE -> selectorFrom(intent)?.let { selector ->
-            when {
-                intent.hasExtra("to") -> SettingsCommand.Move(selector, intExtra(intent, "to") ?: 0)
-                intent.hasExtra("delta") -> {
-                    val index = SettingsCommands.resolveIndex(settings.targets, selector)
-                        ?: return null
-                    SettingsCommand.Move(selector, index + (intExtra(intent, "delta") ?: 0))
+    /**
+     * Broadcasts the state again after the service reaches [wantRunning] (or the
+     * timeout passes), using [goAsync] so the receiver is not killed first.
+     */
+    private fun publishSettledState(
+        context: Context,
+        ok: Boolean,
+        message: String,
+        wantRunning: Boolean,
+    ) {
+        val pending = goAsync()
+        val appContext = context.applicationContext
+        CoroutineScope(Dispatchers.Default).launch {
+            try {
+                withTimeoutOrNull(SERVICE_SETTLE_TIMEOUT_MS) {
+                    ReconnectService.status.first { it.running == wantRunning }
                 }
-
-                else -> null
+                val state = SettingsStateJson.encode(
+                    settings = SettingsStore.get(appContext).settings.value,
+                    running = ReconnectService.status.value.running,
+                )
+                appContext.sendBroadcast(
+                    Intent(ACTION_STATE_CHANGED)
+                        .putExtra("ok", ok)
+                        .putExtra("message", message)
+                        .putExtra("state", state),
+                )
+            } finally {
+                pending.finish()
             }
         }
+    }
 
-        ACTION_SET_ORDER -> SettingsCommand.SetOrder(
-            intent.getStringExtra("order")
-                ?.split(",")
-                ?.map { it.trim() }
-                ?.filter { it.isNotEmpty() }
-                .orEmpty(),
-        )
+    private data class Parsed(val command: SettingsCommand? = null, val error: String? = null)
 
-        else -> null
+    private fun parseCommand(action: String, intent: Intent, settings: AppSettings): Parsed {
+        // A selector extra that is present but not a number is a bug in the
+        // caller, not an instruction to use index 0.
+        if (intent.hasExtra("index") && intExtra(intent, "index") == null) {
+            return Parsed(error = "index must be a number")
+        }
+        return when (action) {
+            ACTION_QUERY -> Parsed(SettingsCommand.Query)
+            ACTION_START -> Parsed(SettingsCommand.Start)
+            ACTION_STOP -> Parsed(SettingsCommand.Stop)
+
+            ACTION_SET_ROTATE_AFTER -> {
+                val value = intExtra(intent, "value") ?: intExtra(intent, "attempts")
+                if (value == null) {
+                    Parsed(error = "SET_ROTATE_AFTER needs a numeric value or attempts")
+                } else {
+                    Parsed(SettingsCommand.SetRotateAfter(value))
+                }
+            }
+
+            ACTION_SET_ENABLED -> {
+                val selector = selectorFrom(intent)
+                    ?: return Parsed(error = "SET_ENABLED needs one selector: id, ssid, label or index")
+                val enabled = enabledFrom(intent)
+                    ?: return Parsed(error = "SET_ENABLED needs enabled=true|false")
+                Parsed(SettingsCommand.SetEnabled(selector, enabled))
+            }
+
+            ACTION_MOVE -> {
+                val selector = selectorFrom(intent)
+                    ?: return Parsed(error = "MOVE needs one selector: id, ssid, label or index")
+                when {
+                    intent.hasExtra("to") -> {
+                        val to = intExtra(intent, "to")
+                            ?: return Parsed(error = "MOVE 'to' must be a number")
+                        Parsed(SettingsCommand.Move(selector, to))
+                    }
+
+                    intent.hasExtra("delta") -> {
+                        val delta = intExtra(intent, "delta")
+                            ?: return Parsed(error = "MOVE 'delta' must be a number")
+                        val index = SettingsCommands.resolveIndex(settings.targets, selector)
+                            ?: return Parsed(error = "MOVE found no target for that selector")
+                        Parsed(SettingsCommand.Move(selector, index + delta))
+                    }
+
+                    else -> Parsed(error = "MOVE needs 'to' or 'delta'")
+                }
+            }
+
+            ACTION_SET_ORDER -> Parsed(
+                SettingsCommand.SetOrder(
+                    intent.getStringExtra("order")
+                        ?.split(",")
+                        ?.map { it.trim() }
+                        ?.filter { it.isNotEmpty() }
+                        .orEmpty(),
+                ),
+            )
+
+            else -> Parsed()
+        }
     }
 
     private fun respond(context: Context, settings: AppSettings, ok: Boolean, message: String) {
@@ -120,8 +209,11 @@ class ControlReceiver : BroadcastReceiver() {
                 putString("state", state)
             },
         )
-        Log.i(TAG, "control: $message")
+        broadcastState(context, ok, message, state)
+    }
 
+    private fun broadcastState(context: Context, ok: Boolean, message: String, state: String) {
+        Log.i(TAG, "control: ok=$ok $message")
         // Listenable by other apps (Tasker "Intent Received"); no package filter.
         context.sendBroadcast(
             Intent(ACTION_STATE_CHANGED)
@@ -147,14 +239,23 @@ class ControlReceiver : BroadcastReceiver() {
         else -> null
     }
 
+    /**
+     * `null` when the extra is absent or its value is not a recognized boolean —
+     * callers reject those instead of silently disabling an entry.
+     */
     @Suppress("DEPRECATION")
-    private fun enabledFrom(intent: Intent): Boolean {
-        if (!intent.hasExtra("enabled")) return true
+    private fun enabledFrom(intent: Intent): Boolean? {
+        if (!intent.hasExtra("enabled")) return null
         return when (val raw = intent.extras?.get("enabled")) {
             is Boolean -> raw
             is Number -> raw.toInt() != 0
-            is String -> raw.equals("true", ignoreCase = true) || raw == "1"
-            else -> true
+            is String -> when (raw.trim().lowercase()) {
+                "true", "1", "yes", "on" -> true
+                "false", "0", "no", "off" -> false
+                else -> null
+            }
+
+            else -> null
         }
     }
 
@@ -172,6 +273,9 @@ class ControlReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "HotspotRelay/Control"
         private const val ACTION_PREFIX = "com.kaovilai.hotspotrelay.action."
+
+        /** How long a START/STOP waits for the service to settle before reporting. */
+        private const val SERVICE_SETTLE_TIMEOUT_MS = 5_000L
 
         const val ACTION_STATE_CHANGED = ACTION_PREFIX + "STATE_CHANGED"
         const val ACTION_QUERY = ACTION_PREFIX + "QUERY"
