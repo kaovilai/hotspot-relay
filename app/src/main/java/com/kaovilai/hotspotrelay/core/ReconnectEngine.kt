@@ -19,8 +19,17 @@ data class WorldSnapshot(
     /** True when the configured iPhone is present in the bonded device list. */
     val iphoneBonded: Boolean,
     val iphoneLink: LinkStatus,
-    /** SSID Android is currently associated with, or null when on no Wi-Fi. */
-    val connectedSsid: String?,
+    /** SSID Android is associated with, or null when on no Wi-Fi or unreadable. */
+    val connectedSsid: String? = null,
+    /**
+     * True when Android is associated with *some* Wi-Fi network. Separate from
+     * [connectedSsid] because Android hides the name when location permission
+     * is denied; in that case we must fail safe and stay idle rather than
+     * fighting a network we cannot identify.
+     */
+    val wifiAssociated: Boolean = connectedSsid != null,
+    /** True when an app-scoped request to the hotspot recently came up. */
+    val hotspotRequestSatisfied: Boolean = false,
 )
 
 sealed interface EngineAction {
@@ -65,6 +74,8 @@ data class RetryPolicy(
      * iPhone shortcut has time to switch Personal Hotspot on.
      */
     val hotspotGraceMs: Long = 8_000,
+    /** How long a link may sit in CONNECTING before we force a new attempt. */
+    val connectingTimeoutMs: Long = 45_000,
     /** Backoff schedule, in order; the last entry repeats. */
     val retryDelaysMs: List<Long> = listOf(15_000, 30_000, 60_000, 120_000, 300_000),
 ) {
@@ -88,28 +99,40 @@ data class EngineState(
  * hotspot:
  *
  *  1. Already on the hotspot -> nothing.
- *  2. On another Wi-Fi network -> nothing (do not fight the user's home Wi-Fi).
+ *  2. On another Wi-Fi network (or one whose name is hidden) -> nothing; do not
+ *     fight the user's home Wi-Fi.
  *  3. No Wi-Fi at all -> make sure Bluetooth is connected to the iPhone, which
  *     is the trigger for the iPhone shortcut that turns Personal Hotspot on.
  *  4. Bluetooth up -> after a short grace period, ask Android to join the
  *     hotspot, retrying with exponential backoff.
+ *
+ * Bluetooth and hotspot retries keep separate budgets: hotspot attempts can back
+ * off to five minutes without delaying a fresh Bluetooth trigger after the link
+ * drops.
  *
  * All timing comes from [WorldSnapshot.nowMs], so tests drive it deterministically.
  */
 class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
 
     private var phase: Phase = Phase.BLOCKED
-    private var failures = 0
-    private var nextAttemptAtMs: Long? = null
+    private var btFailures = 0
+    private var wifiFailures = 0
+    private var nextBtAttemptAtMs: Long? = null
+    private var nextWifiAttemptAtMs: Long? = null
     private var blockedReason: BlockReason? = null
     private var connectedSinceMs: Long? = null
     private var lastLink: LinkStatus? = null
     private var linkConnectedAtMs: Long? = null
+    private var connectingSinceMs: Long? = null
 
     fun state(): EngineState = EngineState(
         phase = phase,
-        failures = failures,
-        nextAttemptAtMs = nextAttemptAtMs,
+        failures = btFailures + wifiFailures,
+        nextAttemptAtMs = if (lastLink == LinkStatus.CONNECTED) {
+            nextWifiAttemptAtMs
+        } else {
+            nextBtAttemptAtMs
+        },
         blockedReason = blockedReason,
         connectedSinceMs = connectedSinceMs,
     )
@@ -117,8 +140,7 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
     /** Forget retry bookkeeping; used when the user restarts the service. */
     fun reset() {
         phase = Phase.BLOCKED
-        failures = 0
-        nextAttemptAtMs = null
+        clearRetries()
         blockedReason = null
         connectedSinceMs = null
         lastLink = null
@@ -128,46 +150,46 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
     fun onTick(snapshot: WorldSnapshot): EngineAction {
         trackLink(snapshot)
 
-        if (snapshot.configured && sameSsid(snapshot.connectedSsid, snapshot.targetSsid)) {
+        if (!snapshot.configured) return block(BlockReason.NOT_CONFIGURED)
+
+        val onHotspot = snapshot.hotspotRequestSatisfied ||
+            sameSsid(snapshot.connectedSsid, snapshot.targetSsid)
+        if (onHotspot) {
             phase = Phase.CONNECTED
             blockedReason = null
-            failures = 0
-            nextAttemptAtMs = null
+            clearRetries()
             if (connectedSinceMs == null) connectedSinceMs = snapshot.nowMs
             return EngineAction.Idle
         }
         connectedSinceMs = null
 
-        if (snapshot.connectedSsid != null) {
+        if (snapshot.wifiAssociated) {
             phase = Phase.ON_OTHER_WIFI
             blockedReason = null
-            failures = 0
-            nextAttemptAtMs = null
+            clearRetries()
             return EngineAction.Idle
         }
 
-        if (!snapshot.configured) return block(BlockReason.NOT_CONFIGURED)
         if (!snapshot.wifiEnabled) return block(BlockReason.WIFI_OFF)
         if (!snapshot.bluetoothEnabled) return block(BlockReason.BLUETOOTH_OFF)
         if (!snapshot.iphoneBonded) return block(BlockReason.IPHONE_NOT_PAIRED)
 
         blockedReason = null
 
-        when (snapshot.iphoneLink) {
-            LinkStatus.CONNECTING -> {
-                phase = Phase.WAITING_FOR_IPHONE
-                return EngineAction.Idle
-            }
+        if (snapshot.iphoneLink == LinkStatus.CONNECTING) {
+            phase = Phase.WAITING_FOR_IPHONE
+            val since = connectingSinceMs ?: snapshot.nowMs.also { connectingSinceMs = it }
+            if (snapshot.nowMs - since < policy.connectingTimeoutMs) return EngineAction.Idle
+            // A missed callback can leave the link "connecting" forever; force a retry.
+            connectingSinceMs = null
+        }
 
-            LinkStatus.DISCONNECTED -> {
-                phase = Phase.WAITING_FOR_IPHONE
-                if (waitingForRetry(snapshot.nowMs)) return EngineAction.Idle
-                failures++
-                nextAttemptAtMs = snapshot.nowMs + policy.delayFor(failures)
-                return EngineAction.ConnectBluetooth
-            }
-
-            LinkStatus.CONNECTED -> Unit
+        if (snapshot.iphoneLink != LinkStatus.CONNECTED) {
+            phase = Phase.WAITING_FOR_IPHONE
+            if (waitingForRetry(snapshot.nowMs, nextBtAttemptAtMs)) return EngineAction.Idle
+            btFailures++
+            nextBtAttemptAtMs = snapshot.nowMs + policy.delayFor(btFailures)
+            return EngineAction.ConnectBluetooth
         }
 
         val connectedAt = linkConnectedAtMs ?: snapshot.nowMs.also { linkConnectedAtMs = it }
@@ -177,35 +199,54 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
         }
 
         phase = Phase.CONNECTING_HOTSPOT
-        if (waitingForRetry(snapshot.nowMs)) return EngineAction.Idle
-        failures++
-        nextAttemptAtMs = snapshot.nowMs + policy.delayFor(failures)
+        if (waitingForRetry(snapshot.nowMs, nextWifiAttemptAtMs)) return EngineAction.Idle
+        wifiFailures++
+        nextWifiAttemptAtMs = snapshot.nowMs + policy.delayFor(wifiFailures)
         return EngineAction.ConnectHotspot
     }
 
     private fun trackLink(snapshot: WorldSnapshot) {
         val previous = lastLink
         lastLink = snapshot.iphoneLink
-        if (snapshot.iphoneLink == LinkStatus.CONNECTED && previous != LinkStatus.CONNECTED) {
-            // Fresh link: the iPhone shortcut has not run yet, and Bluetooth
-            // retries should start from the shortest delay again.
-            linkConnectedAtMs = snapshot.nowMs
-            failures = 0
-            nextAttemptAtMs = null
-        } else if (snapshot.iphoneLink == LinkStatus.DISCONNECTED) {
-            linkConnectedAtMs = null
+        when {
+            snapshot.iphoneLink == LinkStatus.CONNECTED && previous != LinkStatus.CONNECTED -> {
+                // Fresh link: the iPhone shortcut has not run yet, and both retry
+                // budgets start over.
+                linkConnectedAtMs = snapshot.nowMs
+                connectingSinceMs = null
+                clearRetries()
+            }
+
+            snapshot.iphoneLink == LinkStatus.DISCONNECTED && previous == LinkStatus.CONNECTED -> {
+                // Link dropped after a successful connection: a new trigger must be
+                // allowed immediately, even if hotspot attempts had backed off.
+                linkConnectedAtMs = null
+                clearRetries()
+            }
+
+            else -> {
+                if (snapshot.iphoneLink == LinkStatus.DISCONNECTED) linkConnectedAtMs = null
+            }
         }
     }
 
-    private fun waitingForRetry(nowMs: Long): Boolean {
-        val next = nextAttemptAtMs ?: return false
-        return nowMs < next
-    }
+    private fun waitingForRetry(nowMs: Long, deadline: Long?): Boolean =
+        deadline != null && nowMs < deadline
 
     private fun block(reason: BlockReason): EngineAction.Blocked {
         phase = Phase.BLOCKED
         blockedReason = reason
+        // Do not let a stale backoff delay the first attempt once the blocker clears.
+        clearRetries()
         return EngineAction.Blocked(reason)
+    }
+
+    private fun clearRetries() {
+        btFailures = 0
+        wifiFailures = 0
+        nextBtAttemptAtMs = null
+        nextWifiAttemptAtMs = null
+        connectingSinceMs = null
     }
 
     private fun sameSsid(a: String?, b: String): Boolean =

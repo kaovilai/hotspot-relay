@@ -18,6 +18,8 @@ class ReconnectEngineTest {
         iphoneLink: LinkStatus = LinkStatus.DISCONNECTED,
         connectedSsid: String? = null,
         targetSsid: String = ssid,
+        wifiAssociated: Boolean = connectedSsid != null,
+        hotspotRequestSatisfied: Boolean = false,
     ) = WorldSnapshot(
         nowMs = nowMs,
         configured = configured,
@@ -27,6 +29,8 @@ class ReconnectEngineTest {
         iphoneBonded = iphoneBonded,
         iphoneLink = iphoneLink,
         connectedSsid = connectedSsid,
+        wifiAssociated = wifiAssociated,
+        hotspotRequestSatisfied = hotspotRequestSatisfied,
     )
 
     @Test
@@ -261,5 +265,81 @@ class ReconnectEngineTest {
 
         assertEquals(EngineAction.Idle, action)
         assertEquals(Phase.ON_OTHER_WIFI, engine.state().phase)
+    }
+
+    @Test
+    fun `association with a hidden ssid counts as another network`() {
+        val engine = ReconnectEngine()
+
+        val action = engine.onTick(
+            snapshot(nowMs = 0, connectedSsid = null, wifiAssociated = true),
+        )
+
+        assertEquals(EngineAction.Idle, action)
+        assertEquals(Phase.ON_OTHER_WIFI, engine.state().phase)
+        assertEquals(0, engine.state().failures)
+    }
+
+    @Test
+    fun `satisfied hotspot request counts as connected`() {
+        val engine = ReconnectEngine()
+
+        val action = engine.onTick(
+            snapshot(nowMs = 0, hotspotRequestSatisfied = true, iphoneLink = LinkStatus.CONNECTED),
+        )
+
+        assertEquals(EngineAction.Idle, action)
+        assertEquals(Phase.CONNECTED, engine.state().phase)
+        assertEquals(0L, engine.state().connectedSinceMs)
+    }
+
+    @Test
+    fun `link stuck in connecting is retried after the timeout`() {
+        val engine = ReconnectEngine(RetryPolicy(hotspotGraceMs = 0, connectingTimeoutMs = 45_000))
+
+        assertEquals(
+            EngineAction.Idle,
+            engine.onTick(snapshot(nowMs = 0, iphoneLink = LinkStatus.CONNECTING)),
+        )
+        assertEquals(
+            EngineAction.Idle,
+            engine.onTick(snapshot(nowMs = 44_999, iphoneLink = LinkStatus.CONNECTING)),
+        )
+        assertEquals(
+            EngineAction.ConnectBluetooth,
+            engine.onTick(snapshot(nowMs = 45_000, iphoneLink = LinkStatus.CONNECTING)),
+        )
+    }
+
+    @Test
+    fun `hotspot backoff does not delay a new bluetooth trigger`() {
+        val engine = ReconnectEngine(RetryPolicy(hotspotGraceMs = 0))
+
+        // Hotspot attempts back off all the way to the five minute cap.
+        engine.onTick(snapshot(nowMs = 0, iphoneLink = LinkStatus.CONNECTED))
+        var now = 0L
+        for (delayMs in listOf(15_000L, 30_000L, 60_000L, 120_000L, 300_000L)) {
+            now += delayMs
+            engine.onTick(snapshot(nowMs = now, iphoneLink = LinkStatus.CONNECTED))
+        }
+        assertEquals(300_000L, engine.state().nextAttemptAtMs!! - now)
+
+        // Link drops: the Bluetooth retry budget is independent and starts fresh.
+        assertEquals(
+            EngineAction.ConnectBluetooth,
+            engine.onTick(snapshot(nowMs = now + 1_000, iphoneLink = LinkStatus.DISCONNECTED)),
+        )
+    }
+
+    @Test
+    fun `blocked state does not keep stale backoff`() {
+        val engine = ReconnectEngine()
+        engine.onTick(snapshot(nowMs = 0)) // first Bluetooth attempt, retry at 15s
+        engine.onTick(snapshot(nowMs = 1_000, wifiEnabled = false))
+
+        assertEquals(
+            EngineAction.ConnectBluetooth,
+            engine.onTick(snapshot(nowMs = 2_000, wifiEnabled = true)),
+        )
     }
 }

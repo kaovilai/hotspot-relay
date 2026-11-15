@@ -39,8 +39,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -66,6 +68,9 @@ fun SettingsScreen(store: SettingsStore) {
     val saved by store.settings.collectAsStateWithLifecycle()
     val status by ReconnectService.status.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val bluetooth = remember { AndroidBluetoothLink.get(context) }
+
+    LaunchedEffect(Unit) { bluetooth.start() }
 
     var iphoneSelector by rememberSaveable { mutableStateOf(saved.iphoneSelector) }
     var hotspotSsid by rememberSaveable { mutableStateOf(saved.hotspotSsid) }
@@ -87,7 +92,7 @@ fun SettingsScreen(store: SettingsStore) {
     val save: () -> Unit = {
         val seconds = tickSeconds.toLongOrNull()?.coerceIn(MIN_TICK_SECONDS, MAX_TICK_SECONDS)
             ?: (saved.tickIntervalMs / 1000)
-        store.update {
+        val stored = store.update {
             it.copy(
                 iphoneSelector = iphoneSelector.trim(),
                 hotspotSsid = hotspotSsid.trim(),
@@ -96,7 +101,12 @@ fun SettingsScreen(store: SettingsStore) {
                 autoStartOnBoot = autoStartOnBoot,
             )
         }
-        tickSeconds = seconds.toString()
+        // Mirror what was persisted (trimmed) so the form is not left "dirty".
+        iphoneSelector = stored.iphoneSelector
+        hotspotSsid = stored.hotspotSsid
+        hotspotPassword = stored.hotspotPassword
+        tickSeconds = (stored.tickIntervalMs / 1000).toString()
+        autoStartOnBoot = stored.autoStartOnBoot
         Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
     }
 
@@ -188,14 +198,18 @@ fun SettingsScreen(store: SettingsStore) {
 
             FilledTonalButton(
                 onClick = {
-                    when (AndroidBluetoothLink(context).enablePairingMode()) {
+                    when (bluetooth.enablePairingMode()) {
                         PairingModeResult.READY -> {
                             val discoverable = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
                                 .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120)
-                            runCatching { context.startActivity(discoverable) }
+                            val launched = runCatching { context.startActivity(discoverable) }.isSuccess
                             Toast.makeText(
                                 context,
-                                "On the iPhone: Settings → Bluetooth → tap this phone to pair",
+                                if (launched) {
+                                    "On the iPhone: Settings → Bluetooth → tap this phone to pair"
+                                } else {
+                                    "Could not open the pairing dialog — grant Nearby devices permission"
+                                },
                                 Toast.LENGTH_LONG,
                             ).show()
                         }

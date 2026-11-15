@@ -27,7 +27,25 @@ jobs:
         run: |
           SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" "platforms;android-37" "build-tools;37.0.0" > /dev/null
+          for pkg in "platforms;android-37.0" "platforms;android-37"; do
+            "$SDKMANAGER" "$pkg" > /dev/null 2>&1 && break
+          done
+          "$SDKMANAGER" "build-tools;37.0.0" > /dev/null 2>&1 || true
+          if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-37" ] && \
+             [ ! -d "$ANDROID_SDK_ROOT/platforms/android-37.0" ]; then
+            echo "android-37 platform not available on this runner" >&2
+            exit 1
+          fi
+
+      - name: Check tag matches versionName
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gradle_version=$(grep -E 'versionName = ' app/build.gradle.kts | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          echo "tag=$version versionName=$gradle_version"
+          if [ "$version" != "$gradle_version" ]; then
+            echo "tag v$version does not match versionName $gradle_version; bump app/build.gradle.kts" >&2
+            exit 1
+          fi
 
       - name: Decode signing keystore
         env:

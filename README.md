@@ -63,10 +63,11 @@ Or grab the APK from [Releases](../../releases/latest).
 1. Open the app, tap **Grant permissions** and allow Nearby devices, Location,
    and notifications. Location is only needed to read the current Wi-Fi name —
    Android redacts SSIDs otherwise.
-2. Enable Bluetooth, then tap **Pair with iPhone (keyboard mode)**. The phone
-   becomes discoverable and advertises a keyboard. On the iPhone:
-   **Settings → Bluetooth → tap this phone** and confirm the pairing code. The
-   iPhone should list it as a keyboard-like device.
+2. Enable Bluetooth, then tap **Pair with iPhone (keyboard mode)**. The first tap
+   registers the phone as a keyboard; if it says "Try again in a second", tap
+   once more — the phone becomes discoverable and advertises a keyboard. On the
+   iPhone: **Settings → Bluetooth → tap this phone** and confirm the pairing
+   code. The iPhone should list it as a keyboard-like device.
 3. Enter the **iPhone Bluetooth name** (or its MAC), the **hotspot SSID**
    (default is `<iPhone name>'s iPhone`), and the **hotspot password**.
 4. Tap **Allow hotspot auto-join** and approve the system dialog. This registers
@@ -104,19 +105,21 @@ and save.
 ## How it decides
 
 `ReconnectEngine` is plain Kotlin with no Android imports, so every rule is
-unit-tested (`./gradlew testDebugUnitTest`, 18 tests). Each tick:
+unit-tested (`./gradlew testDebugUnitTest`, 23 tests). Each tick:
 
 | World state | Action |
 | --- | --- |
-| Associated with the hotspot SSID | idle, report connected |
-| Associated with any other SSID | idle — never fights your home Wi-Fi |
+| Associated with the hotspot SSID (or our own request to it came up) | idle, report connected |
+| Associated with any other SSID — including one whose name Android hides | idle — never fights your home Wi-Fi |
 | No Wi-Fi, Bluetooth/Wi-Fi off, iPhone not paired, or not configured | blocked, with the reason |
 | No Wi-Fi, iPhone link down | `ConnectBluetooth`, backing off 15s…300s |
-| iPhone link connecting | idle, wait |
+| iPhone link connecting | idle; after 45s treat as stuck and retry |
 | iPhone link up | wait 8s for the shortcut, then `ConnectHotspot`, same backoff |
 
-Backoff counters reset as soon as the link comes up or the hotspot is joined, so
-a fresh attempt always starts at the short delay.
+Bluetooth and hotspot retries keep separate budgets, so hotspot attempts backing
+off to five minutes never delay a fresh trigger after the link drops. Both reset
+as soon as the link comes up or the hotspot is joined, so a fresh attempt always
+starts at the short delay.
 
 ## Limitations worth knowing
 
@@ -135,6 +138,11 @@ a fresh attempt always starts at the short delay.
 - **Hotspot password storage.** It is kept in app-private SharedPreferences
   (sandboxed, excluded from backups). This is a personal automation app, not a
   secrets vault.
+- **WPA2 assumed.** The app registers the hotspot with a WPA2 passphrase. If the
+  iPhone hotspot is WPA3-only (iOS 16+ "Maximize Compatibility" turned off), the
+  join will fail — leave Maximize Compatibility on.
+- **Updates restart the loop.** The service is restarted after a reboot and after
+  Obtainium replaces the package, as long as it was running before.
 - **iOS ends the hotspot when no clients are attached.** Because Android stays
   connected while in range, this normally does not bite; if the iPhone's own
   hotspot timeout has turned it off, the next reconnect triggers the shortcut

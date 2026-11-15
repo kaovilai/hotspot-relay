@@ -13,7 +13,6 @@ import android.content.pm.PackageManager
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.kaovilai.hotspotrelay.core.LinkStatus
-import java.util.concurrent.ConcurrentHashMap
 
 data class BluetoothSnapshot(
     val enabled: Boolean,
@@ -26,7 +25,7 @@ enum class PairingModeResult {
     /** HID app registered; make the phone discoverable now and pair from iOS. */
     READY,
 
-    /** The HID proxy is still binding; try again in a moment. */
+    /** The HID proxy is still binding or registering; try again in a moment. */
     NOT_READY,
 
     /** BLUETOOTH_CONNECT is missing or Bluetooth is off. */
@@ -44,24 +43,22 @@ enum class PairingModeResult {
  * iPhone while it acts as the HID host. iOS accepts Android as a keyboard and
  * fires its Bluetooth automation when the link comes up.
  *
- * A2DP and headset connects are also attempted as harmless extras for devices
- * that accept them.
+ * HID registration is per-app global, so exactly one instance exists; the
+ * settings screen and the service share it.
  *
  * Side effects documented in the README: while the HID app is registered, the
  * phone's own HID *host* service is disabled (Bluetooth mice/keyboards do not
  * work), and the iPhone shows a connected keyboard. Both go away as soon as the
  * hotspot is joined, because the service calls [disconnectTrigger].
  */
-class AndroidBluetoothLink(private val context: Context) {
+class AndroidBluetoothLink private constructor(private val context: Context) {
 
     private val manager: BluetoothManager? =
-        context.applicationContext.getSystemService(BluetoothManager::class.java)
+        context.getSystemService(BluetoothManager::class.java)
 
     private val adapter: BluetoothAdapter? get() = manager?.adapter
 
-    private val proxies = ConcurrentHashMap<Int, BluetoothProfile>()
-    private val profileIds = listOf(BluetoothProfile.A2DP, BluetoothProfile.HEADSET)
-
+    @Volatile
     private var hidDevice: BluetoothHidDevice? = null
 
     @Volatile
@@ -92,14 +89,12 @@ class AndroidBluetoothLink(private val context: Context) {
 
     private val proxyListener = object : BluetoothProfile.ServiceListener {
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-            proxies[profile] = proxy
             if (profile == BluetoothProfile.HID_DEVICE && proxy is BluetoothHidDevice) {
                 hidDevice = proxy
             }
         }
 
         override fun onServiceDisconnected(profile: Int) {
-            proxies.remove(profile)
             if (profile == BluetoothProfile.HID_DEVICE) {
                 hidDevice = null
                 hidRegistered = false
@@ -111,30 +106,57 @@ class AndroidBluetoothLink(private val context: Context) {
         if (!hasConnectPermission()) return
         val adapter = adapter ?: return
         if (!adapter.isEnabled) return
-        (profileIds + BluetoothProfile.HID_DEVICE).forEach { id ->
-            runCatching { adapter.getProfileProxy(context.applicationContext, proxyListener, id) }
-                .onFailure { Log.w(TAG, "profile proxy $id unavailable", it) }
-        }
+        if (hidDevice != null) return
+        runCatching { adapter.getProfileProxy(context.applicationContext, proxyListener, BluetoothProfile.HID_DEVICE) }
+            .onFailure { Log.w(TAG, "HID profile proxy unavailable", it) }
     }
 
     fun stop() {
         unregisterHid()
-        val adapter = adapter ?: return
-        proxies.forEach { (id, proxy) ->
-            runCatching { adapter.closeProfileProxy(id, proxy) }
+        val hid = hidDevice
+        if (hid != null) {
+            runCatching { adapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hid) }
         }
-        proxies.clear()
         hidDevice = null
+        hidRegistered = false
+        hidLink = LinkStatus.DISCONNECTED
     }
 
     fun snapshot(selector: String): BluetoothSnapshot {
-        val adapter = adapter ?: return BluetoothSnapshot(false, false, LinkStatus.DISCONNECTED)
-        if (!adapter.isEnabled) return BluetoothSnapshot(false, false, LinkStatus.DISCONNECTED)
-        val device = findDevice(selector) ?: return BluetoothSnapshot(true, false, LinkStatus.DISCONNECTED)
-        val link = when {
-            hidTargetAddress == device.address && hidLink != LinkStatus.DISCONNECTED -> hidLink
-            else -> profileState(device)
+        if (!hasConnectPermission()) {
+            return BluetoothSnapshot(false, false, LinkStatus.DISCONNECTED)
         }
+        val adapter = adapter ?: return BluetoothSnapshot(false, false, LinkStatus.DISCONNECTED)
+        if (!adapter.isEnabled) {
+            // Radio cycled: cached HID state is meaningless now.
+            hidLink = LinkStatus.DISCONNECTED
+            hidTargetAddress = null
+            return BluetoothSnapshot(false, false, LinkStatus.DISCONNECTED)
+        }
+
+        val device = findDevice(selector)
+            ?: return BluetoothSnapshot(true, false, LinkStatus.DISCONNECTED)
+
+        if (hidTargetAddress != device.address) {
+            hidTargetAddress = device.address
+            hidLink = LinkStatus.DISCONNECTED
+        }
+        if (hidDevice == null) start()
+
+        // The callback cache can miss events (adapter cycle, process timing);
+        // always confirm against the live profile state when possible.
+        val hid = hidDevice
+        val link = if (hid != null) {
+            when (runCatching { hid.getConnectionState(device) }
+                .getOrDefault(BluetoothProfile.STATE_DISCONNECTED)) {
+                BluetoothProfile.STATE_CONNECTED -> LinkStatus.CONNECTED
+                BluetoothProfile.STATE_CONNECTING -> LinkStatus.CONNECTING
+                else -> LinkStatus.DISCONNECTED
+            }
+        } else {
+            hidLink
+        }
+        hidLink = link
         return BluetoothSnapshot(enabled = true, bonded = true, link = link)
     }
 
@@ -144,12 +166,16 @@ class AndroidBluetoothLink(private val context: Context) {
      */
     fun requestConnection(selector: String): Boolean {
         if (!hasConnectPermission()) return false
+        val adapter = adapter ?: return false
+        if (!adapter.isEnabled) return false
+
         val device = findDevice(selector) ?: return false
         hidTargetAddress = device.address
 
+        if (hidDevice == null) start()
         val hid = hidDevice
         if (hid == null) {
-            Log.i(TAG, "HID device profile unavailable; enable Bluetooth and retry")
+            Log.i(TAG, "HID device profile not bound yet; retrying next tick")
             return false
         }
         if (!hidRegistered) registerHid(hid)
@@ -172,23 +198,30 @@ class AndroidBluetoothLink(private val context: Context) {
         if (!hasConnectPermission()) return PairingModeResult.UNAVAILABLE
         val adapter = adapter ?: return PairingModeResult.UNAVAILABLE
         if (!adapter.isEnabled) return PairingModeResult.UNAVAILABLE
+
         start()
         val hid = hidDevice ?: return PairingModeResult.NOT_READY
-        if (!hidRegistered) registerHid(hid)
+        if (!hidRegistered) {
+            registerHid(hid)
+            // Registration lands in onAppStatusChanged; the caller retries.
+            return PairingModeResult.NOT_READY
+        }
         return PairingModeResult.READY
     }
 
     /**
      * Drops the trigger link once the hotspot is joined: unregisters the HID app
-     * (which frees the phone's HID host again) and disconnects known links.
+     * (which frees the phone's HID host again) and disconnects the link.
      */
     fun disconnectTrigger() {
-        val device = hidTargetAddress ?: return
-        val adapter = adapter
-        val deviceRef = runCatching { adapter?.getRemoteDevice(device) }.getOrNull()
-        if (deviceRef != null && hasConnectPermission()) {
-            runCatching { hidDevice?.disconnect(deviceRef) }
-                .onFailure { Log.w(TAG, "HID disconnect failed", it) }
+        val address = hidTargetAddress
+        val hid = hidDevice
+        if (hid != null && address != null && hasConnectPermission()) {
+            val device = runCatching { adapter?.getRemoteDevice(address) }.getOrNull()
+            if (device != null) {
+                runCatching { hid.disconnect(device) }
+                    .onFailure { Log.w(TAG, "HID disconnect failed", it) }
+            }
         }
         unregisterHid()
         hidLink = LinkStatus.DISCONNECTED
@@ -203,32 +236,19 @@ class AndroidBluetoothLink(private val context: Context) {
             KEYBOARD_DESCRIPTOR,
         )
         val executor = ContextCompat.getMainExecutor(context.applicationContext)
-        runCatching { hid.registerApp(sdp, null, null, executor, hidCallback) }
+        val started = runCatching { hid.registerApp(sdp, null, null, executor, hidCallback) }
             .onFailure { Log.w(TAG, "HID registerApp failed", it) }
+            .getOrDefault(false)
+        Log.i(TAG, "HID registerApp requested=$started")
     }
 
     private fun unregisterHid() {
         val hid = hidDevice ?: return
-        if (!hidRegistered) return
+        // Attempt even when the cached flag says "not registered": the flag can
+        // miss an event, and a live registration must never be left behind.
         runCatching { hid.unregisterApp() }
             .onFailure { Log.w(TAG, "HID unregisterApp failed", it) }
         hidRegistered = false
-    }
-
-    private fun profileState(device: BluetoothDevice): LinkStatus {
-        if (!hasConnectPermission()) return LinkStatus.DISCONNECTED
-        var sawConnecting = false
-        for ((id, proxy) in proxies) {
-            if (id == BluetoothProfile.HID_DEVICE) continue
-            val state = runCatching { proxy.getConnectionState(device) }
-                .onFailure { Log.w(TAG, "state query via profile $id failed", it) }
-                .getOrDefault(BluetoothProfile.STATE_DISCONNECTED)
-            when (state) {
-                BluetoothProfile.STATE_CONNECTED -> return LinkStatus.CONNECTED
-                BluetoothProfile.STATE_CONNECTING -> sawConnecting = true
-            }
-        }
-        return if (sawConnecting) LinkStatus.CONNECTING else LinkStatus.DISCONNECTED
     }
 
     @SuppressLint("MissingPermission")
@@ -252,6 +272,15 @@ class AndroidBluetoothLink(private val context: Context) {
 
     companion object {
         private const val TAG = "HotspotRelay/Bt"
+
+        @Volatile
+        private var instance: AndroidBluetoothLink? = null
+
+        /** One instance for the whole process: HID registration is per-app global. */
+        fun get(context: Context): AndroidBluetoothLink =
+            instance ?: synchronized(this) {
+                instance ?: AndroidBluetoothLink(context.applicationContext).also { instance = it }
+            }
 
         private val MAC_ADDRESS = Regex("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 

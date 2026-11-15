@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
@@ -63,11 +64,12 @@ class ReconnectService : Service() {
     private lateinit var wifi: AndroidWifiLink
     private val engine = ReconnectEngine()
     private var lastPhase: Phase? = null
+    private var lastNotificationMessage: String? = null
 
     override fun onCreate() {
         super.onCreate()
         settingsStore = SettingsStore.get(this)
-        bluetooth = AndroidBluetoothLink(this).also { it.start() }
+        bluetooth = AndroidBluetoothLink.get(this).also { it.start() }
         wifi = AndroidWifiLink(this)
         createNotificationChannel()
     }
@@ -79,7 +81,11 @@ class ReconnectService : Service() {
             return START_NOT_STICKY
         }
 
-        startForegroundSafely(buildNotification("Starting…"))
+        if (!startForegroundSafely(buildNotification("Starting…"))) {
+            Log.e(TAG, "cannot become a foreground service; stopping")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         settingsStore.update { it.copy(serviceEnabled = true) }
         publish(ServiceStatus(running = true, message = "Starting…"))
 
@@ -110,16 +116,21 @@ class ReconnectService : Service() {
     }
 
     private fun tick(settings: AppSettings) {
+        // Monotonic clock: wall-clock jumps must not stretch or skip the backoff.
+        val nowMs = SystemClock.elapsedRealtime()
         val bt = bluetooth.snapshot(settings.iphoneSelector)
+        val association = wifi.association()
         val snapshot = WorldSnapshot(
-            nowMs = System.currentTimeMillis(),
+            nowMs = nowMs,
             configured = settings.isConfigured,
             targetSsid = settings.hotspotSsid,
             bluetoothEnabled = bt.enabled,
             wifiEnabled = wifi.isWifiEnabled(),
             iphoneBonded = bt.bonded,
             iphoneLink = bt.link,
-            connectedSsid = wifi.connectedSsid(),
+            connectedSsid = association.ssid,
+            wifiAssociated = association.associated,
+            hotspotRequestSatisfied = wifi.isHotspotRequestSatisfied(nowMs),
         )
 
         val action = engine.onTick(snapshot)
@@ -148,14 +159,20 @@ class ReconnectService : Service() {
             lastTickMs = snapshot.nowMs,
         )
         publish(status)
-        getSystemService(NotificationManager::class.java)
-            ?.notify(NOTIFICATION_ID, buildNotification(message))
-
-        // The trigger link has done its job once the hotspot is joined. Dropping
-        // it restores the phone's own HID host and un-attaches the iPhone keyboard.
-        if (state.phase == Phase.CONNECTED && lastPhase != Phase.CONNECTED) {
-            bluetooth.disconnectTrigger()
+        if (message != lastNotificationMessage) {
+            getSystemService(NotificationManager::class.java)
+                ?.notify(NOTIFICATION_ID, buildNotification(message))
+            lastNotificationMessage = message
         }
+
+        // The trigger link has done its job as soon as we stop trying to reach the
+        // hotspot: joined, moved to another Wi-Fi, or blocked. Dropping it restores
+        // the phone's own HID host and un-attaches the iPhone keyboard.
+        val wasTryingHotspot = lastPhase == Phase.WAITING_FOR_HOTSPOT ||
+            lastPhase == Phase.CONNECTING_HOTSPOT
+        val tryingHotspot = state.phase == Phase.WAITING_FOR_HOTSPOT ||
+            state.phase == Phase.CONNECTING_HOTSPOT
+        if (wasTryingHotspot && !tryingHotspot) bluetooth.disconnectTrigger()
         lastPhase = state.phase
     }
 
@@ -176,6 +193,11 @@ class ReconnectService : Service() {
         BlockReason.IPHONE_NOT_PAIRED -> "iPhone not paired — pair it in system Bluetooth settings"
     }
 
+    /**
+     * Keeps the CPU awake across the short binder call that starts a Bluetooth
+     * attempt. The connection itself completes asynchronously; the next tick
+     * observes the result.
+     */
     private fun withWakeLock(block: () -> Unit) {
         val power = getSystemService(PowerManager::class.java) ?: return block()
         val lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:attempt")
@@ -187,7 +209,7 @@ class ReconnectService : Service() {
         }
     }
 
-    private fun startForegroundSafely(notification: Notification) {
+    private fun startForegroundSafely(notification: Notification): Boolean =
         runCatching {
             ServiceCompat.startForeground(
                 this,
@@ -196,7 +218,7 @@ class ReconnectService : Service() {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
             )
         }.onFailure { Log.e(TAG, "startForeground failed", it) }
-    }
+            .isSuccess
 
     private fun buildNotification(message: String): Notification {
         val contentIntent = PendingIntent.getActivity(
