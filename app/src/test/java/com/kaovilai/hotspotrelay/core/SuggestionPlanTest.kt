@@ -102,6 +102,21 @@ class SuggestionPlanTest {
     }
 
     @Test
+    fun `disabling the first of two same-ssid targets registers the remaining password`() {
+        val first = target("a", ssid = "shared", password = "old")
+        val second = target("b", ssid = "shared", password = "new")
+        val plan = SuggestionPlanner.plan(
+            settings(first, second),
+            settings(first.copy(enabled = false), second),
+        )
+
+        // activeBefore is deduplicated by SSID, so the remaining target's
+        // different password is registered instead of being skipped.
+        assertEquals(listOf(second), plan.register)
+        assertTrue(plan.forget.isEmpty())
+    }
+
+    @Test
     fun `incomplete targets are never registered`() {
         val incomplete = target("a").copy(password = "", enabled = false)
         val plan = SuggestionPlanner.plan(

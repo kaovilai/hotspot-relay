@@ -65,6 +65,19 @@ class ReconnectService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var loop: Job? = null
 
+    /**
+     * Set before the shutdown status is published. A tick already running on
+     * [Dispatchers.Default] can reach `finishTick()` after `onDestroy()`; without
+     * this guard it would publish `running = true` again (and broadcast a
+     * spurious "service started"), leaving queries reporting a stopped service
+     * as running.
+     */
+    @Volatile
+    private var destroyed = false
+
+    /** Serializes [publish] with the destroyed flag so shutdown stays terminal. */
+    private val statusLock = Any()
+
     private lateinit var settingsStore: SettingsStore
     private lateinit var bluetooth: AndroidBluetoothLink
     private lateinit var wifi: AndroidWifiLink
@@ -109,6 +122,7 @@ class ReconnectService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        synchronized(statusLock) { destroyed = true }
         loop?.cancel()
         scope.cancel()
         wifi.stop()
@@ -374,9 +388,15 @@ class ReconnectService : Service() {
     }
 
     private fun publish(status: ServiceStatus) {
-        val wasRunning = _status.value.running
-        _status.value = status
-        if (wasRunning != status.running) broadcastRunningState(status.running)
+        synchronized(statusLock) {
+            // A tick that outlived shutdown must not resurrect `running = true`;
+            // the stop status published from onDestroy() is terminal. The lock
+            // makes the check-and-write atomic against onDestroy().
+            if (destroyed && status.running) return
+            val wasRunning = _status.value.running
+            _status.value = status
+            if (wasRunning != status.running) broadcastRunningState(status.running)
+        }
     }
 
     /**

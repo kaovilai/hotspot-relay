@@ -43,6 +43,10 @@ object SuggestionPlanner {
 
         val activeBefore = before.targets
             .filter { it.enabled && it.isComplete }
+            // Same rule as the after-state: one credential pair per SSID, taken
+            // from the highest-priority target. Otherwise disabling that target
+            // would leave the other target's password unregistered.
+            .distinctBy { it.ssid }
             .map { it.ssid to it.password }
             .toSet()
 
