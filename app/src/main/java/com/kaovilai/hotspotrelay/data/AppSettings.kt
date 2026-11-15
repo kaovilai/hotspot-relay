@@ -20,7 +20,11 @@ data class AppSettings(
     val serviceEnabled: Boolean = false,
 ) {
     val isConfigured: Boolean
-        get() = iphoneSelector.isNotBlank() && hotspotSsid.isNotBlank()
+        // The password is required: without it the Wi-Fi builders would register
+        // an open network, and an open AP with the same SSID would auto-join.
+        get() = iphoneSelector.isNotBlank() &&
+            hotspotSsid.isNotBlank() &&
+            hotspotPassword.isNotBlank()
 }
 
 /**

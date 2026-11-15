@@ -131,7 +131,7 @@ class ReconnectService : Service() {
             iphoneLink = bt.link,
             connectedSsid = association.ssid,
             wifiAssociated = association.associated,
-            hotspotRequestSatisfied = wifi.isHotspotRequestSatisfied(nowMs),
+            hotspotRequestSatisfied = wifi.isHotspotRequestSatisfied(settings.hotspotSsid, nowMs),
         )
 
         val action = engine.onTick(snapshot)
@@ -187,7 +187,7 @@ class ReconnectService : Service() {
         }
 
     private fun blockMessage(reason: BlockReason): String = when (reason) {
-        BlockReason.NOT_CONFIGURED -> "Add the iPhone name and hotspot SSID in the app"
+        BlockReason.NOT_CONFIGURED -> "Add the iPhone, hotspot SSID and password in the app"
         BlockReason.WIFI_OFF -> "Wi-Fi is off"
         BlockReason.BLUETOOTH_OFF -> "Bluetooth is off"
         BlockReason.IPHONE_NOT_PAIRED -> "iPhone not paired — pair it in system Bluetooth settings"

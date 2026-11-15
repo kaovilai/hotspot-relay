@@ -109,7 +109,7 @@ fun SettingsScreen(store: SettingsStore) {
         autoStartOnBoot = stored.autoStartOnBoot
         // Keep Android's suggestion in sync with edited credentials; otherwise the
         // system would keep auto-joining with the old password.
-        if (stored.hotspotSsid.isNotBlank()) {
+        if (stored.hotspotSsid.isNotBlank() && stored.hotspotPassword.isNotBlank()) {
             AndroidWifiLink(context).ensureSuggestion(stored.hotspotSsid, stored.hotspotPassword)
         }
         Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
@@ -197,7 +197,7 @@ fun SettingsScreen(store: SettingsStore) {
                         .ensureSuggestion(hotspotSsid.trim(), hotspotPassword)
                     Toast.makeText(context, suggestionMessage(outcome), Toast.LENGTH_LONG).show()
                 },
-                enabled = hotspotSsid.isNotBlank(),
+                enabled = hotspotSsid.isNotBlank() && hotspotPassword.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Allow hotspot auto-join") }
 
@@ -325,7 +325,7 @@ private fun suggestionMessage(outcome: SuggestionOutcome): String = when (outcom
     SuggestionOutcome.ALREADY_REGISTERED -> "Hotspot already registered"
     SuggestionOutcome.DUPLICATE -> "Hotspot already registered"
     SuggestionOutcome.REJECTED -> "System rejected the suggestion (check Wi-Fi permissions)"
-    SuggestionOutcome.ERROR -> "Could not register the hotspot"
+    SuggestionOutcome.ERROR -> "Could not register the hotspot (SSID and password required)"
 }
 
 private fun requiredPermissions(): Array<String> {

@@ -9,6 +9,7 @@ import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.net.wifi.WifiNetworkSpecifier
 import android.net.wifi.WifiNetworkSuggestion
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -50,9 +51,11 @@ class AndroidWifiLink(private val context: Context) {
     /** Currently associated Wi-Fi networks. */
     private val trackedWifi: MutableSet<Network> = ConcurrentHashMap.newKeySet()
 
-    /** Request callbacks that are still live, so stop() can cancel them. */
-    private val activeRequests: MutableSet<ConnectivityManager.NetworkCallback> =
-        ConcurrentHashMap.newKeySet()
+    private data class RequestHandle(val ssid: String, val release: () -> Unit)
+
+    /** Live hotspot requests, keyed by callback, so they can be cancelled. */
+    private val activeRequests =
+        ConcurrentHashMap<ConnectivityManager.NetworkCallback, RequestHandle>()
 
     @Volatile
     private var trackingRegistered = false
@@ -62,6 +65,9 @@ class AndroidWifiLink(private val context: Context) {
 
     @Volatile
     private var satisfiedNetwork: Network? = null
+
+    @Volatile
+    private var satisfiedSsid: String? = null
 
     private val wifiRequest = NetworkRequest.Builder()
         .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -96,22 +102,38 @@ class AndroidWifiLink(private val context: Context) {
         trackedWifi.clear()
         // Cancel any hotspot request still in flight; a stopped service must not
         // keep a connection (or its system prompt) alive.
-        val manager = connectivity
-        activeRequests.toList().forEach { callback ->
+        activeRequests.entries.toList().forEach { (callback, handle) ->
             activeRequests.remove(callback)
-            runCatching { manager?.unregisterNetworkCallback(callback) }
+            runCatching { handle.release() }
         }
         satisfiedNetwork = null
+        satisfiedSsid = null
         hotspotRequestSatisfiedAtMs = 0L
     }
 
     @Suppress("DEPRECATION")
     fun isWifiEnabled(): Boolean = wifi?.isWifiEnabled == true
 
+    @Suppress("DEPRECATION")
     fun association(): WifiAssociation {
         if (trackingRegistered) {
-            if (trackedWifi.isEmpty()) return WifiAssociation(false, null)
-            return WifiAssociation(true, currentSsid())
+            if (trackedWifi.isNotEmpty()) return WifiAssociation(true, currentSsid())
+            // Callbacks may not have arrived yet; an empty set does not prove there
+            // is no Wi-Fi. Ask synchronously before letting the engine touch radios.
+            val observed = runCatching {
+                val manager = connectivity ?: return@runCatching false
+                manager.allNetworks.any { network ->
+                    manager.getNetworkCapabilities(network)
+                        ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                }
+            }.getOrNull()
+            return when (observed) {
+                true -> WifiAssociation(true, currentSsid())
+                false -> WifiAssociation(false, null)
+                // Observation failed: fail safe and stay idle rather than start an
+                // unnecessary Bluetooth trigger.
+                null -> WifiAssociation(true, null)
+            }
         }
         // Tracking registration failed; fall back to the default route.
         val manager = connectivity ?: return WifiAssociation(false, null)
@@ -136,21 +158,27 @@ class AndroidWifiLink(private val context: Context) {
     }.getOrNull()
 
     /**
-     * True when our own targeted request to the hotspot recently came up. This
-     * covers the case where the hotspot is not the device's default network
-     * (no internet), so [association] alone would never report it.
+     * True when our own targeted request for [ssid] recently came up. This covers
+     * the case where the hotspot is not the device's default network (no
+     * internet), so [association] alone would never report it. Bound to the SSID
+     * so a request for an old setting cannot satisfy a new one.
      */
     fun isHotspotRequestSatisfied(
+        ssid: String,
         nowMs: Long,
         windowMs: Long = REQUEST_SATISFIED_WINDOW_MS,
     ): Boolean {
+        if (ssid.isBlank() || satisfiedSsid != ssid) return false
         val satisfiedAt = hotspotRequestSatisfiedAtMs
         return satisfiedAt != 0L && nowMs - satisfiedAt in 0..windowMs
     }
 
-    fun hasSuggestion(ssid: String): Boolean =
-        runCatching { wifi?.getNetworkSuggestions().orEmpty().any { it.ssid == ssid } }
+    /** `getNetworkSuggestions()` only exists from API 30. */
+    fun hasSuggestion(ssid: String): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        return runCatching { wifi?.getNetworkSuggestions().orEmpty().any { it.ssid == ssid } }
             .getOrDefault(false)
+    }
 
     /**
      * Registers the hotspot as an auto-join suggestion. Android shows a
@@ -165,20 +193,27 @@ class AndroidWifiLink(private val context: Context) {
         passphrase: String,
         replaceExisting: Boolean = true,
     ): SuggestionOutcome {
-        if (ssid.isBlank()) return SuggestionOutcome.ERROR
+        // Without a password this would register an OPEN network, and an open AP
+        // advertising the same SSID would then be auto-joined.
+        if (ssid.isBlank() || passphrase.isEmpty()) return SuggestionOutcome.ERROR
         val manager = wifi ?: return SuggestionOutcome.ERROR
+
+        val suggestion = runCatching {
+            WifiNetworkSuggestion.Builder()
+                .setSsid(ssid)
+                .setWpa2Passphrase(passphrase)
+                .build()
+        }.onFailure { Log.w(TAG, "cannot build suggestion", it) }
+            .getOrNull() ?: return SuggestionOutcome.ERROR
 
         if (hasSuggestion(ssid)) {
             if (!replaceExisting) return SuggestionOutcome.ALREADY_REGISTERED
             removeSuggestions(ssid)
+        } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            // API 29 cannot enumerate suggestions; removing the same-credential
+            // entry is the best available way to clear a stale duplicate.
+            runCatching { manager.removeNetworkSuggestions(listOf(suggestion)) }
         }
-
-        val suggestion = runCatching {
-            val builder = WifiNetworkSuggestion.Builder().setSsid(ssid)
-            if (passphrase.isNotEmpty()) builder.setWpa2Passphrase(passphrase)
-            builder.build()
-        }.onFailure { Log.w(TAG, "cannot build suggestion", it) }
-            .getOrNull() ?: return SuggestionOutcome.ERROR
 
         val status = runCatching { manager.addNetworkSuggestions(listOf(suggestion)) }
             .onFailure { Log.w(TAG, "addNetworkSuggestions threw", it) }
@@ -192,6 +227,7 @@ class AndroidWifiLink(private val context: Context) {
     }
 
     private fun removeSuggestions(ssid: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val existing = runCatching { wifi?.getNetworkSuggestions().orEmpty() }
             .getOrDefault(emptyList())
             .filter { it.ssid == ssid }
@@ -212,12 +248,19 @@ class AndroidWifiLink(private val context: Context) {
      */
     fun requestHotspot(ssid: String, passphrase: String, holdMs: Long = REQUEST_HOLD_MS) {
         val manager = connectivity ?: return
-        if (ssid.isBlank()) return
+        if (ssid.isBlank() || passphrase.isEmpty()) {
+            Log.w(TAG, "refusing hotspot request without an SSID and password")
+            return
+        }
+
+        // Obsolete requests for other targets must not keep running.
+        cancelRequests(exceptSsid = ssid)
 
         val specifier = runCatching {
-            val builder = WifiNetworkSpecifier.Builder().setSsid(ssid)
-            if (passphrase.isNotEmpty()) builder.setWpa2Passphrase(passphrase)
-            builder.build()
+            WifiNetworkSpecifier.Builder()
+                .setSsid(ssid)
+                .setWpa2Passphrase(passphrase)
+                .build()
         }.onFailure { Log.w(TAG, "cannot build specifier", it) }
             .getOrNull() ?: return
 
@@ -234,9 +277,10 @@ class AndroidWifiLink(private val context: Context) {
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 // Late delivery after stop() must not resurrect the association.
-                if (!activeRequests.contains(this)) return
+                if (!activeRequests.containsKey(this)) return
                 hotspotRequestSatisfiedAtMs = SystemClock.elapsedRealtime()
                 satisfiedNetwork = network
+                satisfiedSsid = ssid
                 Log.i(TAG, "hotspot request satisfied")
                 // Hold the association briefly so the system's own auto-join can
                 // take over from the suggestion, then release the app-scoped one.
@@ -247,6 +291,7 @@ class AndroidWifiLink(private val context: Context) {
             override fun onLost(network: Network) {
                 if (network == satisfiedNetwork) {
                     satisfiedNetwork = null
+                    satisfiedSsid = null
                     hotspotRequestSatisfiedAtMs = 0L
                 }
             }
@@ -267,7 +312,8 @@ class AndroidWifiLink(private val context: Context) {
         }
 
         // Register before the call so an immediate callback is not treated as late.
-        activeRequests.add(callback)
+        val directRelease = requireNotNull(release)
+        activeRequests[callback] = RequestHandle(ssid, directRelease)
         val accepted = runCatching { manager.requestNetwork(request, callback) }
             .onFailure { Log.w(TAG, "requestNetwork failed", it) }
             .isSuccess
@@ -279,6 +325,15 @@ class AndroidWifiLink(private val context: Context) {
         // The no-timeout overload exists on all supported API levels; enforce the
         // timeout ourselves. onAvailable reschedules this to the shorter hold.
         mainHandler.postDelayed(releaseRunnable, REQUEST_TIMEOUT_MS)
+    }
+
+    private fun cancelRequests(exceptSsid: String?) {
+        activeRequests.entries.toList().forEach { (callback, handle) ->
+            if (exceptSsid == null || handle.ssid != exceptSsid) {
+                activeRequests.remove(callback)
+                runCatching { handle.release() }
+            }
+        }
     }
 
     private fun ssidOf(capabilities: NetworkCapabilities): String? {
