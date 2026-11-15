@@ -40,7 +40,7 @@ class SuggestionPlanTest {
         val b = target("b")
         val plan = SuggestionPlanner.plan(settings(a, b), settings(a, b.copy(enabled = false)))
 
-        assertEquals(setOf("SSID b"), plan.forget)
+        assertEquals(setOf("SSID b"), plan.forget.map { it.ssid }.toSet())
         assertTrue(plan.register.isEmpty())
         assertEquals(listOf(a), plan.ensure)
     }
@@ -81,7 +81,7 @@ class SuggestionPlanTest {
 
         assertEquals(listOf(a), plan.ensure)
         assertTrue(plan.register.isEmpty())
-        assertEquals(setOf("SSID b"), plan.forget)
+        assertEquals(setOf("SSID b"), plan.forget.map { it.ssid }.toSet())
     }
 
     @Test
@@ -117,6 +117,14 @@ class SuggestionPlanTest {
     }
 
     @Test
+    fun `forgotten targets keep their credentials for API 29 removal`() {
+        val removed = target("a", password = "secret")
+        val plan = SuggestionPlanner.plan(settings(removed), settings())
+
+        assertEquals(listOf(removed.ssid to removed.password), plan.forget.map { it.ssid to it.password })
+    }
+
+    @Test
     fun `incomplete targets are never registered`() {
         val incomplete = target("a").copy(password = "", enabled = false)
         val plan = SuggestionPlanner.plan(
@@ -128,6 +136,6 @@ class SuggestionPlanTest {
         // SSID is revoked rather than (re)registered.
         assertTrue(plan.register.isEmpty())
         assertTrue(plan.ensure.isEmpty())
-        assertEquals(setOf("SSID a"), plan.forget)
+        assertEquals(setOf("SSID a"), plan.forget.map { it.ssid }.toSet())
     }
 }

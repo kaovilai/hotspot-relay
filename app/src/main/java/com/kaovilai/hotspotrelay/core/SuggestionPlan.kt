@@ -9,8 +9,12 @@ import com.kaovilai.hotspotrelay.data.IphoneTarget
  * unit-tested instead of only exercised on a device.
  */
 data class SuggestionPlan(
-    /** SSIDs no longer used by any enabled, complete target. */
-    val forget: Set<String>,
+    /**
+     * Old targets whose SSID is no longer used by any enabled, complete target.
+     * Credentials are kept so API 29, which cannot enumerate suggestions, can
+     * still reconstruct and remove the matching one.
+     */
+    val forget: List<IphoneTarget>,
     /** Targets to (re)register, replacing an existing suggestion for the SSID. */
     val register: List<IphoneTarget>,
     /**
@@ -34,12 +38,12 @@ object SuggestionPlanner {
      * earlier registration failed, is retried without touching the live one.
      */
     fun plan(before: AppSettings, after: AppSettings): SuggestionPlan {
-        if (before.targets == after.targets) return SuggestionPlan(emptySet(), emptyList(), emptyList())
+        if (before.targets == after.targets) return SuggestionPlan(emptyList(), emptyList(), emptyList())
         val active = after.targets.filter { it.enabled && it.isComplete }
         val keep = active.map { it.ssid }.toSet()
-        val forget = before.targets.map { it.ssid }
-            .filter { it.isNotBlank() && it !in keep }
-            .toSet()
+        val forget = before.targets
+            .filter { it.ssid.isNotBlank() && it.ssid !in keep }
+            .distinctBy { it.ssid to it.password }
 
         val activeBefore = before.targets
             .filter { it.enabled && it.isComplete }

@@ -23,7 +23,9 @@ object SuggestionSync {
         if (plan.isEmpty) return
         val wifi = AndroidWifiLink(context)
 
-        plan.forget.forEach { ssid -> runCatching { wifi.forgetSuggestion(ssid) } }
+        plan.forget.forEach { target ->
+            runCatching { wifi.forgetSuggestion(target.ssid, target.password) }
+        }
 
         plan.register.forEach { target ->
             register(wifi, target.ssid, target.password, replaceExisting = true)

@@ -133,7 +133,7 @@ and save.
 ## How it decides
 
 `ReconnectEngine` is plain Kotlin with no Android imports, so every rule is
-unit-tested (`./gradlew testDebugUnitTest`, 58 tests). Each tick:
+unit-tested (`./gradlew testDebugUnitTest`, 59 tests). Each tick:
 
 | World state | Action |
 | --- | --- |
