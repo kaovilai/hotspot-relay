@@ -69,6 +69,9 @@ class ReconnectService : Service() {
     private val engine = ReconnectEngine()
     private val rotation = TargetRotation()
     private var lastPhase: Phase? = null
+    private var lastTargetId: String? = null
+    /** Attempts issued to the current target; drives rotation. */
+    private var attemptsOnTarget = 0
     private var lastNotificationMessage: String? = null
 
     override fun onCreate() {
@@ -153,10 +156,19 @@ class ReconnectService : Service() {
                 target = joined,
                 nowMs = nowMs,
             )
+            lastTargetId = joined.id
+            attemptsOnTarget = 0
             return
         }
 
         var target = rotation.current(targets) ?: targets.first()
+        // A target that disappeared or was disabled is replaced by the rotation;
+        // that replacement must not inherit the previous phone's retry deadline.
+        if (lastTargetId != target.id) {
+            engine.reset()
+            attemptsOnTarget = 0
+        }
+
         var action: EngineAction = EngineAction.Idle
         var rotations = 0
         while (true) {
@@ -179,13 +191,16 @@ class ReconnectService : Service() {
                 action.reason == BlockReason.IPHONE_NOT_PAIRED
             val attemptDue = action == EngineAction.ConnectBluetooth ||
                 action == EngineAction.ConnectHotspot
-            // failures counts issued attempts; rotate only when a *new* attempt
-            // is due, so a target is never abandoned mid-connect.
-            val exhausted = attemptDue && engine.state().failures > settings.rotateAfterAttempts
+            // The engine's own failure count is not a per-target attempt counter
+            // (it resets whenever the link changes). Count the attempts we actually
+            // issued to this target ourselves, and rotate only when a new attempt is
+            // due so a target is never abandoned mid-connect.
+            val exhausted = attemptDue && attemptsOnTarget >= settings.rotateAfterAttempts
 
             if ((notPaired || exhausted) && rotations < targets.lastIndex) {
                 rotation.advance(targets)
                 engine.reset()
+                attemptsOnTarget = 0
                 rotations++
                 target = rotation.current(targets) ?: target
                 continue
@@ -194,6 +209,14 @@ class ReconnectService : Service() {
         }
 
         val state = engine.state()
+        if (action == EngineAction.ConnectBluetooth || action == EngineAction.ConnectHotspot) {
+            attemptsOnTarget++
+        }
+        if (state.phase == Phase.CONNECTED) {
+            // Made it: the next outage gets a fresh rotation budget.
+            attemptsOnTarget = 0
+        }
+        lastTargetId = target.id
         val message = when (action) {
             EngineAction.ConnectBluetooth -> {
                 withWakeLock { bluetooth.requestConnection(target.btSelector) }

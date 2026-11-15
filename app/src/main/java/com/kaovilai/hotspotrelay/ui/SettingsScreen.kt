@@ -43,6 +43,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -58,6 +59,7 @@ import com.kaovilai.hotspotrelay.core.Phase
 import com.kaovilai.hotspotrelay.data.AppSettings
 import com.kaovilai.hotspotrelay.data.IphoneTarget
 import com.kaovilai.hotspotrelay.data.SettingsStore
+import com.kaovilai.hotspotrelay.data.TargetsCodec
 import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
 import com.kaovilai.hotspotrelay.platform.PairingModeResult
@@ -75,7 +77,7 @@ fun SettingsScreen(store: SettingsStore) {
 
     LaunchedEffect(Unit) { bluetooth.start() }
 
-    var rows by remember { mutableStateOf(saved.targets) }
+    var rows by rememberSaveable(stateSaver = TargetsSaver) { mutableStateOf(saved.targets) }
     var rotateAfter by rememberSaveable { mutableStateOf(saved.rotateAfterAttempts.toString()) }
     var tickSeconds by rememberSaveable { mutableStateOf((saved.tickIntervalMs / 1000).toString()) }
     var autoStartOnBoot by rememberSaveable { mutableStateOf(saved.autoStartOnBoot) }
@@ -109,6 +111,11 @@ fun SettingsScreen(store: SettingsStore) {
         rotateAfter = stored.rotateAfterAttempts.toString()
         tickSeconds = (stored.tickIntervalMs / 1000).toString()
         autoStartOnBoot = stored.autoStartOnBoot
+        // Keep Android's suggestions in sync with edited credentials; otherwise the
+        // system would keep auto-joining with the old password.
+        val wifi = AndroidWifiLink(context)
+        stored.targets.filter { it.isComplete }
+            .forEach { wifi.ensureSuggestion(it.ssid, it.password) }
         return stored
     }
 
@@ -250,12 +257,18 @@ fun SettingsScreen(store: SettingsStore) {
                         ).show()
                         return@FilledTonalButton
                     }
-                    complete.forEach { wifi.ensureSuggestion(it.ssid, it.password) }
-                    Toast.makeText(
-                        context,
-                        "Registered ${complete.size} hotspot(s) — approve the system prompt if shown",
-                        Toast.LENGTH_LONG,
-                    ).show()
+                    val outcomes = complete.map { wifi.ensureSuggestion(it.ssid, it.password) }
+                    val registered = outcomes.count {
+                        it == SuggestionOutcome.ADDED ||
+                            it == SuggestionOutcome.ALREADY_REGISTERED ||
+                            it == SuggestionOutcome.DUPLICATE
+                    }
+                    val failed = outcomes.size - registered
+                    val message = buildString {
+                        append("Registered $registered of ${outcomes.size} hotspot(s)")
+                        if (failed > 0) append(" — $failed rejected; check SSID and WPA2 password")
+                    }
+                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Allow hotspot auto-join for all iPhones") }
@@ -461,3 +474,9 @@ private fun openBatterySettings(context: Context) {
 
 private const val MIN_TICK_SECONDS = 5L
 private const val MAX_TICK_SECONDS = 300L
+
+/** Keeps unsaved target edits across activity recreation (rotation, process death). */
+private val TargetsSaver = Saver<List<IphoneTarget>, String>(
+    save = { TargetsCodec.encode(it) },
+    restore = { TargetsCodec.decode(it) },
+)
