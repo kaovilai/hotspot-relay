@@ -169,7 +169,7 @@ adb shell am broadcast -n com.kaovilai.hotspotrelay/.receiver.ControlReceiver \
 | --- | --- | --- |
 | `…action.SET_ENABLED` | `id` \| `ssid` \| `label` \| `index`, `enabled` (bool, required) | Enable/disable one iPhone; its Wi-Fi suggestion is registered or removed to match |
 | `…action.MOVE` | selector, `to` (0-based) or `delta` (+1/−1) | Reorder one iPhone; `delta` moves it relative to its position |
-| `…action.SET_ORDER` | `order` = comma-separated SSIDs/labels/ids | Full reorder; unlisted entries are appended |
+| `…action.SET_ORDER` | `order` = comma-separated SSIDs/labels/ids | Full reorder; unlisted entries are appended. Every listed entry must match (id > ssid > label), otherwise the command is rejected and nothing changes |
 | `…action.SET_ROTATE_AFTER` | `value` (1–10) | Rotation limit; `1` = round-robin |
 | `…action.START` / `…action.STOP` | — | Start/stop the loop |
 | `…action.QUERY` | — | No change; returns the current state |

@@ -108,7 +108,12 @@ object SettingsCommands {
         val ordered = mutableListOf<IphoneTarget>()
         val missing = mutableListOf<String>()
         keys.forEach { key ->
-            val match = remaining.firstOrNull { matches(it, key) }
+            // Same precedence as the single-target selectors: id, then ssid, then
+            // label/display name. A key must match something.
+            val match = remaining.firstOrNull { it.id == key }
+                ?: remaining.firstOrNull { it.ssid == key }
+                ?: remaining.firstOrNull { it.label == key }
+                ?: remaining.firstOrNull { it.displayName == key }
             if (match != null) {
                 ordered += match
                 remaining.remove(match)
@@ -116,15 +121,24 @@ object SettingsCommands {
                 missing += key
             }
         }
+        if (missing.isNotEmpty()) {
+            // Reject the whole order instead of applying a partial one to a
+            // different set of targets and reporting success.
+            return CommandOutcome(
+                settings,
+                ok = false,
+                message = "order not applied; unknown entries: ${missing.joinToString(", ")}",
+            )
+        }
         if (ordered.isEmpty()) {
             return CommandOutcome(settings, ok = false, message = "no iPhone matched the order list")
         }
         ordered += remaining
-        val message = buildString {
-            append("order set to ${ordered.joinToString(", ") { it.displayName }}")
-            if (missing.isNotEmpty()) append(" (ignored: ${missing.joinToString(", ")})")
-        }
-        return CommandOutcome(settings.copy(targets = ordered), ok = true, message = message)
+        return CommandOutcome(
+            settings.copy(targets = ordered),
+            ok = true,
+            message = "order set to ${ordered.joinToString(", ") { it.displayName }}",
+        )
     }
 
     private fun setRotateAfter(
@@ -171,7 +185,4 @@ object SettingsCommands {
                 is TargetSelector.ByIndex -> null
             }
         }
-
-    private fun matches(target: IphoneTarget, key: String): Boolean =
-        target.id == key || target.ssid == key || target.label == key || target.displayName == key
 }

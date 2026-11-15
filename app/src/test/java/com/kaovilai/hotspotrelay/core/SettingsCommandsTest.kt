@@ -111,15 +111,38 @@ class SettingsCommandsTest {
     }
 
     @Test
-    fun `set order ignores unknown keys and reports them`() {
+    fun `set order rejects unknown keys without changing anything`() {
         val outcome = SettingsCommands.apply(
             settings,
             SettingsCommand.SetOrder(listOf("Work", "Ghost")),
         )
 
-        assertTrue(outcome.ok)
-        assertEquals(listOf("b", "a", "c"), outcome.settings.targets.map { it.id })
+        assertFalse(outcome.ok)
+        assertEquals(settings, outcome.settings)
         assertTrue(outcome.message.contains("Ghost"))
+    }
+
+    @Test
+    fun `set order prefers an id match over a label match`() {
+        val labelled = IphoneTarget(
+            id = "x",
+            label = "Alpha",
+            btSelector = "iPhone x",
+            ssid = "Sx",
+            password = "pw",
+        )
+        val idMatch = IphoneTarget(
+            id = "Alpha",
+            btSelector = "iPhone y",
+            ssid = "Sy",
+            password = "pw",
+        )
+        val local = AppSettings(targets = listOf(labelled, idMatch))
+
+        val outcome = SettingsCommands.apply(local, SettingsCommand.SetOrder(listOf("Alpha")))
+
+        assertTrue(outcome.ok)
+        assertEquals(listOf("Alpha", "x"), outcome.settings.targets.map { it.id })
     }
 
     @Test
