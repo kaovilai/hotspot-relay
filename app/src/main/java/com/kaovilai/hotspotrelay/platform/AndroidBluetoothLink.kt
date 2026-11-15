@@ -20,6 +20,7 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.kaovilai.hotspotrelay.core.HidConnectionPolicy
 import com.kaovilai.hotspotrelay.core.LinkStatus
+import com.kaovilai.hotspotrelay.core.PendingDrops
 import com.kaovilai.hotspotrelay.core.PolicyDropLedger
 
 data class BluetoothSnapshot(
@@ -142,10 +143,10 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     /**
      * Addresses enforcement asked to disconnect. Until the stack reports them
      * gone, snapshots must say DISCONNECTED: otherwise a tick can read the stale
-     * CONNECTED state, count it as a fresh trigger and clear the backoff.
+     * CONNECTED state, count it as a fresh trigger and clear the backoff. A
+     * snapshot only clears the batch it verified, so a concurrent publish wins.
      */
-    @Volatile
-    private var pendingDisconnectAddresses: List<String> = emptyList()
+    private val pendingDrops = PendingDrops()
 
     /** Device currently probed by "Check iPhone pairing" (not the service target). */
     @Volatile
@@ -211,7 +212,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         endPairingMode()
         allowedUntilMs = 0
         connectedAddresses.clear()
-        pendingDisconnectAddresses = emptyList()
+        pendingDrops.publish(emptyList())
         policyDrops.clear()
         unregisterHid()
         val hid = hidDevice
@@ -232,12 +233,13 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             // Radio cycled: cached HID state is meaningless now.
             hidLink = LinkStatus.DISCONNECTED
             hidTargetAddress = null
-            pendingDisconnectAddresses = emptyList()
+            pendingDrops.publish(emptyList())
             return BluetoothSnapshot(false, false, LinkStatus.DISCONNECTED)
         }
 
-        if (pendingDisconnectAddresses.isNotEmpty()) {
-            val stillConnected = pendingDisconnectAddresses.any { address ->
+        val pendingBatch = pendingDrops.current()
+        if (pendingBatch.isNotEmpty()) {
+            val stillConnected = pendingBatch.any { address ->
                 val peer = runCatching { adapter.getRemoteDevice(address) }.getOrNull()
                     ?: return@any false
                 val hid = hidDevice ?: return@any false
@@ -245,12 +247,14 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                     .getOrDefault(BluetoothProfile.STATE_DISCONNECTED) ==
                     BluetoothProfile.STATE_CONNECTED
             }
-            if (!stillConnected) pendingDisconnectAddresses = emptyList()
+            // Clear only the batch just verified: enforcement may have published a
+            // newer one meanwhile, and erasing it would repeat that drop.
+            if (!stillConnected) pendingDrops.clearIfCurrent(pendingBatch)
         }
 
         val device = findDevice(selector)
             ?: return BluetoothSnapshot(true, false, LinkStatus.DISCONNECTED)
-        val pendingForDevice = device.address in pendingDisconnectAddresses
+        val pendingForDevice = device.address in pendingDrops.current()
 
         if (hidTargetAddress != device.address) {
             // The configured iPhone changed: drop the old link and its registration
@@ -531,12 +535,11 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                         // confirmed) is the same drop, so it is not reported again.
                         // Only a drop of the service's own target counts; a stray
                         // remembered peer must not make the engine keep its backoff.
-                        if (hidTargetAddress in denied &&
-                            hidTargetAddress !in pendingDisconnectAddresses
-                        ) {
+                        val target = hidTargetAddress
+                        if (target != null && target in denied && !pendingDrops.contains(target)) {
                             policyDrops.record()
                         }
-                        pendingDisconnectAddresses = denied
+                        pendingDrops.publish(denied)
                         denied.forEach { address ->
                             val device = runCatching { adapter?.getRemoteDevice(address) }
                                 .getOrNull() ?: return@forEach
