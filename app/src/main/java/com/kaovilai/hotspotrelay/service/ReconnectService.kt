@@ -192,9 +192,6 @@ class ReconnectService : Service() {
 
         var action: EngineAction = EngineAction.Idle
         var rotations = 0
-        // Read once: the HID window may have dropped the link since the last tick.
-        // The engine must keep its backoff then instead of re-arming the keyboard.
-        val droppedByPolicy = bluetooth.consumeLinkDroppedByPolicy()
         while (true) {
             val bt = bluetooth.snapshot(target.btSelector)
             val snapshot = WorldSnapshot(
@@ -208,7 +205,7 @@ class ReconnectService : Service() {
                 connectedSsid = association.ssid,
                 wifiAssociated = association.associated,
                 hotspotRequestSatisfied = wifi.isHotspotRequestSatisfied(target.ssid, nowMs),
-                linkDroppedByPolicy = droppedByPolicy,
+                linkDroppedByPolicy = bt.droppedByPolicy,
             )
             action = engine.onTick(snapshot)
 
