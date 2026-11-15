@@ -49,7 +49,7 @@ Personal Hotspot on; the app then joins the hotspot, retrying until it works.
 ### Obtainium (recommended)
 
 1. Install [Obtainium](https://github.com/ImranR98/Obtainium).
-2. Add app → URL `https://github.com/kaovilai/ios-hotspot-automation-for-android`
+2. Add app → URL `https://github.com/kaovilai/hotspot-relay`
    → source *GitHub releases* (defaults are fine).
 3. Obtainium tracks the APK asset on each release. Same signing key every time,
    so updates install over the previous version.
