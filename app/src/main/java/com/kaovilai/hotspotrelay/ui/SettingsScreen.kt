@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kaovilai.hotspotrelay.core.Phase
 import com.kaovilai.hotspotrelay.data.AppSettings
+import org.json.JSONObject
 import com.kaovilai.hotspotrelay.data.IphoneTarget
 import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.data.TargetsCodec
@@ -86,8 +87,10 @@ fun SettingsScreen(store: SettingsStore) {
     // The persisted values the form was last synced with. Comparing against this
     // rather than against `saved` means an external change (Tasker, adb) does not
     // look like a local edit: it can be adopted while the form is untouched, and
-    // Save cannot silently revert it.
-    var synced by remember { mutableStateOf(saved) }
+    // Save cannot silently revert it. It is saved across activity recreation as
+    // well, otherwise a draft that outlives the rotation loses the baseline it
+    // was edited against.
+    var synced by rememberSaveable(stateSaver = SyncedSaver) { mutableStateOf(saved) }
 
     val dirty = rows != synced.targets ||
         rotateAfter != synced.rotateAfterAttempts.toString() ||
@@ -507,4 +510,34 @@ private const val MAX_TICK_SECONDS = 300L
 private val TargetsSaver = Saver<List<IphoneTarget>, String>(
     save = { TargetsCodec.encode(it) },
     restore = { TargetsCodec.decode(it) },
+)
+
+/**
+ * Saves the form's synced baseline across activity recreation. Without it a
+ * draft restored by [rememberSaveable] would be compared against the latest
+ * persisted settings instead of the values it was edited from, making a
+ * reverted edit look dirty and letting Start/Save overwrite an external change.
+ */
+private val SyncedSaver = Saver<AppSettings, String>(
+    save = { settings ->
+        JSONObject().apply {
+            put("targets", TargetsCodec.encode(settings.targets))
+            put("rotate", settings.rotateAfterAttempts)
+            put("tick", settings.tickIntervalMs)
+            put("boot", settings.autoStartOnBoot)
+            put("service", settings.serviceEnabled)
+        }.toString()
+    },
+    restore = { raw ->
+        runCatching {
+            val json = JSONObject(raw)
+            AppSettings(
+                targets = TargetsCodec.decode(json.getString("targets")),
+                rotateAfterAttempts = json.getInt("rotate"),
+                tickIntervalMs = json.getLong("tick"),
+                autoStartOnBoot = json.getBoolean("boot"),
+                serviceEnabled = json.getBoolean("service"),
+            )
+        }.getOrNull()
+    },
 )
