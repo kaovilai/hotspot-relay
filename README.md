@@ -63,8 +63,10 @@ Or grab the APK from [Releases](../../releases/latest).
 ### On the Android phone
 
 1. Open the app, tap **Grant permissions** and allow Nearby devices, Location,
-   and notifications. Location is only needed to read the current Wi-Fi name —
-   Android redacts SSIDs otherwise.
+   and notifications. The Nearby devices permission only exists on Android 12+;
+   on Android 10–11 the equivalent is **Location**, which scanning also needs
+   there. Location is also what lets the app read the current Wi-Fi name —
+   without it Android redacts SSIDs.
 2. Enable Bluetooth, then tap **Pair with iPhone (keyboard mode)**. The first tap
    registers the phone as a keyboard; if it says "Try again in a second", tap
    once more — the phone becomes discoverable and advertises a keyboard. On the
@@ -72,11 +74,16 @@ Or grab the APK from [Releases](../../releases/latest).
    code. The iPhone should list it as a keyboard-like device.
    **Repeat this for every iPhone you add** — an unpaired iPhone is skipped.
 3. Add one entry per iPhone: **Add iPhone**, then fill in the iPhone's
-   Bluetooth name (or MAC), **hotspot SSID** and **hotspot password**. The
-   SSID is exactly the iPhone's device name — **Settings → General → About →
-   Name** (on a phone named `Alice's iPhone` the hotspot is `Alice's iPhone`,
-   not `Alice's iPhone's iPhone`). Use **↑ / ↓** to set priority and the switch
-   to enable or disable an entry.
+   Bluetooth name (or MAC), **hotspot SSID** and **hotspot password**.
+   **Pick paired** lists the phones already bonded to this device; **Scan
+   nearby** finds discoverable Bluetooth devices (needs the Nearby devices
+   permission on Android 12+ or Location on 10–11, and a discoverable iPhone);
+   **Use current Wi-Fi** fills the SSID when you are already on that hotspot.
+   The SSID is exactly the iPhone's device name — **Settings → General → About
+   → Name** (on a phone named
+   `Alice's iPhone` the hotspot is `Alice's iPhone`, not
+   `Alice's iPhone's iPhone`). Use **↑ / ↓** to set priority and the switch to
+   enable or disable an entry.
 4. Set **Move to the next iPhone after N failed attempts**: `1` behaves as
    round-robin, higher values give the first iPhone a longer turn (priority).
 5. Tap **Allow hotspot auto-join for all iPhones** and approve the system
@@ -133,7 +140,7 @@ and save.
 ## How it decides
 
 `ReconnectEngine` is plain Kotlin with no Android imports, so every rule is
-unit-tested (`./gradlew testDebugUnitTest`, 59 tests). Each tick:
+unit-tested (`./gradlew testDebugUnitTest`, 61 tests). Each tick:
 
 | World state | Action |
 | --- | --- |
@@ -177,6 +184,11 @@ adb shell am broadcast -n com.kaovilai.hotspotrelay/.receiver.ControlReceiver \
 Rules:
 
 - Exactly one selector extra is needed (`id` > `ssid` > `label` > `index`).
+  Each selector matches its own field: `ssid` never matches a label or a
+  displayed name, and `id` never matches anything but the entry id; only
+  `label` falls back to the displayed name (useful when the label is blank).
+- `MOVE` takes exactly one of `to` or `delta`; supplying both, or a
+  malformed value for either, rejects the command.
 - Malformed commands are rejected with `ok=false`: a missing `enabled`, a
   non-boolean `enabled`, a non-numeric `to`/`delta`/`index`/`value`, or `MOVE`
   without either `to` or `delta`. The app never guesses a default.

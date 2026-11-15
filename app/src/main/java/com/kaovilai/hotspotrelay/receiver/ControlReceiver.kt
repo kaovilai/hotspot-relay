@@ -130,10 +130,20 @@ class ControlReceiver : BroadcastReceiver() {
             ACTION_MOVE -> {
                 val selector = selectorFrom(intent)
                     ?: return Parsed(error = "MOVE needs one selector: id, ssid, label or index")
+                // Validate every present extra before choosing a branch: a
+                // malformed 'delta' next to a valid 'to' is still a caller bug.
+                if (intent.hasExtra("to") && intExtra(intent, "to") == null) {
+                    return Parsed(error = "MOVE 'to' must be a number")
+                }
+                if (intent.hasExtra("delta") && intExtra(intent, "delta") == null) {
+                    return Parsed(error = "MOVE 'delta' must be a number")
+                }
+                if (intent.hasExtra("to") && intent.hasExtra("delta")) {
+                    return Parsed(error = "MOVE needs either 'to' or 'delta', not both")
+                }
                 when {
                     intent.hasExtra("to") -> {
-                        val to = intExtra(intent, "to")
-                            ?: return Parsed(error = "MOVE 'to' must be a number")
+                        val to = intExtra(intent, "to")!!
                         Parsed(SettingsCommand.Move(selector, to))
                     }
 
@@ -220,7 +230,13 @@ class ControlReceiver : BroadcastReceiver() {
         if (!intent.hasExtra("enabled")) return null
         return when (val raw = intent.extras?.get("enabled")) {
             is Boolean -> raw
-            is Number -> raw.toInt() != 0
+            // Only 0 and 1 are accepted numeric aliases. Anything else (2, 0.5)
+            // is a caller bug and must not be truncated into a boolean.
+            is Number -> when (raw.toDouble()) {
+                1.0 -> true
+                0.0 -> false
+                else -> null
+            }
             is String -> when (raw.trim().lowercase()) {
                 "true", "1", "yes", "on" -> true
                 "false", "0", "no", "off" -> false

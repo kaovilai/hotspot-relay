@@ -205,6 +205,16 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         return accepted
     }
 
+    /** Bonded devices, for the "pick a paired iPhone" picker. */
+    @SuppressLint("MissingPermission")
+    fun pairedDevices(): List<PickableDevice> {
+        if (!hasConnectPermission()) return emptyList()
+        val devices = runCatching { adapter?.bondedDevices }.getOrNull().orEmpty()
+        return devices
+            .map { PickableDevice(it.name, it.address) }
+            .sortedBy { it.label.lowercase() }
+    }
+
     /**
      * First-time pairing helper. iOS only treats the phone as a keyboard (HID
      * host link) if the HID SDP record is advertised while the iPhone pairs, so
@@ -285,6 +295,12 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             }
         }
     }
+
+    /**
+     * Whether the Bluetooth permission needed to list bonded devices is held.
+     * Callers use this to explain an empty picker instead of guessing.
+     */
+    fun canReadPairedDevices(): Boolean = hasConnectPermission()
 
     private fun hasConnectPermission(): Boolean {
         // BLUETOOTH_CONNECT only exists from Android 12; on API 29-30 the legacy
