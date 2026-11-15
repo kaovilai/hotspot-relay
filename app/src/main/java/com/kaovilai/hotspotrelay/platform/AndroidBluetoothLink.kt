@@ -145,6 +145,9 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             ?: return BluetoothSnapshot(true, false, LinkStatus.DISCONNECTED)
 
         if (hidTargetAddress != device.address) {
+            // The configured iPhone changed: drop the old link and its registration
+            // instead of leaving a stale HID link attached to the previous device.
+            if (hidTargetAddress != null) disconnectTrigger()
             hidTargetAddress = device.address
             hidLink = LinkStatus.DISCONNECTED
         }
