@@ -238,6 +238,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
 
         val device = findDevice(selector)
             ?: return BluetoothSnapshot(true, false, LinkStatus.DISCONNECTED)
+        val pendingForDevice = device.address in pendingDisconnectAddresses
 
         if (hidTargetAddress != device.address) {
             // The configured iPhone changed: drop the old link and its registration
@@ -264,7 +265,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         hidLink = link
         // While a policy drop is still settling, report DISCONNECTED regardless of
         // the live state so the engine never mistakes it for a fresh link.
-        val reported = if (pendingDisconnectAddresses.isEmpty()) link else LinkStatus.DISCONNECTED
+        val reported = if (pendingForDevice) LinkStatus.DISCONNECTED else link
         return BluetoothSnapshot(
             enabled = true,
             bonded = true,
@@ -386,6 +387,10 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         timeoutMs: Long = PROBE_TIMEOUT_MS,
         onResult: (Boolean) -> Unit,
     ) {
+        if (!hasConnectPermission()) {
+            onResult(false)
+            return
+        }
         start()
         val adapter = adapter
         val device = findDevice(selector)
@@ -450,7 +455,20 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         mainHandler.postDelayed(poll, PROBE_POLL_MS)
     }
 
+    /**
+     * A peer may keep its link only while the global window is open *and* it is
+     * the peer that window was opened for: the service's current target, a
+     * device being probed, or any peer during explicit pairing. A remembered
+     * keyboard reconnecting on its own must not inherit another iPhone's window.
+     */
+    private fun isPeerAllowed(address: String, nowMs: Long): Boolean {
+        if (!HidConnectionPolicy.isAllowed(nowMs, allowedUntilMs)) return false
+        if (pairingMode) return true
+        return address == hidTargetAddress || address == probeAddress
+    }
+
     private fun isLiveConnected(address: String): Boolean {
+        if (!hasConnectPermission()) return false
         val hid = hidDevice ?: return false
         val peer = runCatching { adapter?.getRemoteDevice(address) }.getOrNull() ?: return false
         return runCatching { hid.getConnectionState(peer) }
@@ -471,39 +489,40 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         val check = object : Runnable {
             override fun run() {
                 val now = SystemClock.elapsedRealtime()
-                if (!HidConnectionPolicy.isAllowed(now, allowedUntilMs)) {
-                    val addresses = connectedAddresses.toList()
-                    if (addresses.isEmpty()) {
-                        enforcement = null
-                        releaseEnforcementWakeLock()
-                        unregisterHid()
-                        return
+                val addresses = connectedAddresses.toList()
+                if (addresses.isEmpty()) {
+                    enforcement = null
+                    releaseEnforcementWakeLock()
+                    unregisterHid()
+                    return
+                }
+                val denied = addresses.filterNot { isPeerAllowed(it, now) }
+                if (denied.isNotEmpty()) {
+                    // Only a drop of the service's own target is reported as a
+                    // policy drop; a stray remembered peer must not make the
+                    // engine keep the target's backoff.
+                    if (hidTargetAddress in denied) {
+                        policyDrop.set(true)
                     }
-                    Log.i(TAG, "dropping HID link: trigger window expired")
-                    // Tell the service this was our own window, not a link failure:
-                    // otherwise the engine resets its backoff and re-arms the
-                    // keyboard on the very next tick.
-                    policyDrop.set(true)
-                    pendingDisconnectAddresses = addresses
-                    addresses.forEach { address ->
+                    pendingDisconnectAddresses = denied
+                    denied.forEach { address ->
                         val device = runCatching { adapter?.getRemoteDevice(address) }
                             .getOrNull() ?: return@forEach
                         dropLink(device)
                     }
                     // disconnect()/unregisterApp() only report command submission.
-                    // If a peer is still connected, keep it tracked and keep this
-                    // check armed instead of leaving an attached keyboard with no
-                    // enforcement behind it.
-                    val stillConnected = addresses.filter { isLiveConnected(it) }
+                    // Peers still connected stay tracked so the check keeps running
+                    // instead of leaving an attached keyboard with no enforcement.
+                    val stillConnected = denied.filter { isLiveConnected(it) }
                     connectedAddresses.clear()
+                    (addresses - denied).forEach { connectedAddresses.add(it) }
                     stillConnected.forEach { connectedAddresses.add(it) }
                     if (stillConnected.isNotEmpty()) {
                         mainHandler.postDelayed(this, HidConnectionPolicy.MIN_CHECK_INTERVAL_MS)
-                    } else {
-                        enforcement = null
-                        releaseEnforcementWakeLock()
+                        return
                     }
-                } else if (connectedAddresses.isEmpty()) {
+                }
+                if (connectedAddresses.isEmpty()) {
                     enforcement = null
                     releaseEnforcementWakeLock()
                 } else {
