@@ -257,16 +257,19 @@ fun SettingsScreen(store: SettingsStore) {
                         ).show()
                         return@FilledTonalButton
                     }
-                    val outcomes = complete.map { wifi.ensureSuggestion(it.ssid, it.password) }
-                    val registered = outcomes.count {
-                        it == SuggestionOutcome.ADDED ||
-                            it == SuggestionOutcome.ALREADY_REGISTERED ||
-                            it == SuggestionOutcome.DUPLICATE
-                    }
-                    val failed = outcomes.size - registered
+                    val results = complete.map { it to wifi.ensureSuggestion(it.ssid, it.password) }
+                    val failed = results
+                        .filter { (_, outcome) ->
+                            outcome == SuggestionOutcome.ERROR || outcome == SuggestionOutcome.REJECTED
+                        }
+                        .map { (target, _) -> target.displayName }
+                    val registered = results.size - failed.size
                     val message = buildString {
-                        append("Registered $registered of ${outcomes.size} hotspot(s)")
-                        if (failed > 0) append(" — $failed rejected; check SSID and WPA2 password")
+                        append("Registered $registered of ${results.size} hotspot(s)")
+                        if (failed.isNotEmpty()) {
+                            append(" — failed: ${failed.joinToString(", ")}")
+                            append(" (check SSID and WPA2 password)")
+                        }
                     }
                     Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                 },
