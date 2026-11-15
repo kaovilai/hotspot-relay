@@ -48,10 +48,11 @@ object SuggestionSync {
         } else {
             plan.ensure
         }
-        // API 29 cannot enumerate suggestions, so "ensure" would remove and
-        // re-add an identical entry there; on 30+ it is a true no-op when the
-        // suggestion exists and repairs it when an earlier add failed.
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // API 29 cannot enumerate suggestions, so a normal "ensure" there would
+        // remove and re-add an identical entry for no reason. An explicit retry
+        // (Save/Start) is different: it exists to repair a failed registration,
+        // and remove-then-add is the only way to do that below API 30.
+        if (retryMissing || Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             ensure.forEach { target ->
                 register(wifi, target.ssid, target.password, replaceExisting = false)
             }

@@ -227,10 +227,22 @@ class ControlReceiver : BroadcastReceiver() {
     private fun intExtra(intent: Intent, key: String): Int? {
         val raw = intent.extras?.get(key) ?: return null
         return when (raw) {
-            is Number -> raw.toInt()
+            is Number -> integralInt(raw)
             is String -> raw.trim().toIntOrNull()
             else -> null
         }
+    }
+
+    /**
+     * Rejects fractional and out-of-range values: `toInt()` would truncate 0.5 to
+     * 0 and wrap 2^32 to 0, silently acting on a different entry than the caller
+     * asked for (`--ef index 0.5`).
+     */
+    private fun integralInt(raw: Number): Int? {
+        val value = raw.toDouble()
+        if (!value.isFinite() || value < Int.MIN_VALUE || value > Int.MAX_VALUE) return null
+        val asInt = value.toInt()
+        return asInt.takeIf { it.toDouble() == value }
     }
 
     companion object {
