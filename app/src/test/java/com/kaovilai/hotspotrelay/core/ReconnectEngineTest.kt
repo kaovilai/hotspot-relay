@@ -62,6 +62,24 @@ class ReconnectEngineTest {
     }
 
     @Test
+    fun `a settling teardown reported again does not move the retry deadline`() {
+        val engine = ReconnectEngine()
+
+        engine.onTick(
+            snapshot(nowMs = 1_000, iphoneLink = LinkStatus.CONNECTED, linkDroppedByPolicy = true),
+        )
+        assertEquals(16_000L, engine.state().nextAttemptAtMs ?: -1L)
+
+        // The peer is still pending, so snapshots keep reporting DISCONNECTED, but
+        // the drop itself is delivered once: the deadline must not drift forward.
+        engine.onTick(snapshot(nowMs = 3_000))
+        engine.onTick(snapshot(nowMs = 8_000))
+        assertEquals(16_000L, engine.state().nextAttemptAtMs ?: -1L)
+        assertEquals(EngineAction.Idle, engine.onTick(snapshot(nowMs = 15_999)))
+        assertEquals(EngineAction.ConnectBluetooth, engine.onTick(snapshot(nowMs = 16_000)))
+    }
+
+    @Test
     fun `re-arming after a policy drop keeps the accumulated backoff`() {
         val engine = ReconnectEngine()
 

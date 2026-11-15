@@ -116,6 +116,9 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
      */
     private val enforcementLock = Any()
 
+    /** When the pending enforcement check is due (guarded by [enforcementLock]). */
+    private var enforcementDueAtMs = 0L
+
     /** HID peers the stack currently reports as connected (main-thread callbacks). */
     private val connectedAddresses = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
@@ -275,16 +278,16 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         // While a policy drop is still settling, report DISCONNECTED regardless of
         // the live state so the engine never mistakes it for a fresh link.
         val reported = if (pendingForDevice) LinkStatus.DISCONNECTED else link
-        // Consume unconditionally (no short-circuit): the ledger records before the
-        // pending set is published, so a snapshot that sees a pending teardown also
-        // sees its drop, and a drop a snapshot beat is delivered on the next one —
-        // exactly once either way.
+        // Each drop is delivered once: enforcement records it before publishing the
+        // pending set, so a snapshot that reports the pending teardown always sees
+        // (or already saw) its drop. Repeating the flag on every later tick would
+        // push the engine's retry deadline out while the teardown settles.
         val justDropped = policyDrops.consume()
         return BluetoothSnapshot(
             enabled = true,
             bonded = true,
             link = reported,
-            droppedByPolicy = pendingForDevice || justDropped,
+            droppedByPolicy = justDropped,
         )
     }
 
@@ -499,8 +502,18 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
      */
     private fun scheduleEnforcement() {
         synchronized(enforcementLock) {
-            if (enforcement != null) return
             acquireEnforcementWakeLock()
+            val existing = enforcement
+            if (existing != null) {
+                // A peer that just connected must be checked within the grace, not
+                // after the pending check's (possibly far) deadline. Only ever move
+                // the check earlier; an already-due check is not postponed.
+                val remaining = (enforcementDueAtMs - SystemClock.elapsedRealtime())
+                    .coerceAtLeast(0L)
+                mainHandler.removeCallbacks(existing)
+                postEnforcement(existing, minOf(remaining, HidConnectionPolicy.GRACE_MS))
+                return
+            }
             val check = object : Runnable {
                 override fun run() {
                     val now = SystemClock.elapsedRealtime()
@@ -513,12 +526,14 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                     val denied = addresses.filterNot { isPeerAllowed(it, now) }
                     if (denied.isNotEmpty()) {
                         // Record before publishing the pending set: a snapshot that
-                        // sees the pending teardown must also see its policy drop,
-                        // and a snapshot that comes earlier gets it on the next tick.
-                        // Only a drop of the service's own target is reported as a
-                        // policy drop; a stray remembered peer must not make the
-                        // engine keep the target's backoff.
-                        if (hidTargetAddress in denied) {
+                        // sees the pending teardown must also see its policy drop.
+                        // A peer that is still pending on a later check (teardown not
+                        // confirmed) is the same drop, so it is not reported again.
+                        // Only a drop of the service's own target counts; a stray
+                        // remembered peer must not make the engine keep its backoff.
+                        if (hidTargetAddress in denied &&
+                            hidTargetAddress !in pendingDisconnectAddresses
+                        ) {
                             policyDrops.record()
                         }
                         pendingDisconnectAddresses = denied
@@ -550,7 +565,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                 }
             }
             enforcement = check
-            mainHandler.postDelayed(check, HidConnectionPolicy.GRACE_MS)
+            postEnforcement(check, HidConnectionPolicy.GRACE_MS)
         }
     }
 
@@ -571,8 +586,14 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     private fun repostEnforcement(check: Runnable, delayMs: Long) {
         synchronized(enforcementLock) {
             if (enforcement !== check) return
-            mainHandler.postDelayed(check, delayMs)
+            postEnforcement(check, delayMs)
         }
+    }
+
+    /** Posts [check] and remembers when it is due. Caller holds the lock. */
+    private fun postEnforcement(check: Runnable, delayMs: Long) {
+        enforcementDueAtMs = SystemClock.elapsedRealtime() + delayMs
+        mainHandler.postDelayed(check, delayMs)
     }
 
     /** Ends [check] only if a cancel/new session has not already replaced it. */
