@@ -21,8 +21,10 @@ import com.kaovilai.hotspotrelay.core.BlockReason
 import com.kaovilai.hotspotrelay.core.EngineAction
 import com.kaovilai.hotspotrelay.core.Phase
 import com.kaovilai.hotspotrelay.core.ReconnectEngine
+import com.kaovilai.hotspotrelay.core.TargetRotation
 import com.kaovilai.hotspotrelay.core.WorldSnapshot
 import com.kaovilai.hotspotrelay.data.AppSettings
+import com.kaovilai.hotspotrelay.data.IphoneTarget
 import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
@@ -44,6 +46,8 @@ data class ServiceStatus(
     val failures: Int = 0,
     val message: String = "",
     val lastTickMs: Long? = null,
+    /** Which configured iPhone the loop is currently working on. */
+    val targetLabel: String? = null,
 )
 
 /**
@@ -63,7 +67,11 @@ class ReconnectService : Service() {
     private lateinit var bluetooth: AndroidBluetoothLink
     private lateinit var wifi: AndroidWifiLink
     private val engine = ReconnectEngine()
+    private val rotation = TargetRotation()
     private var lastPhase: Phase? = null
+    private var lastTargetId: String? = null
+    /** Attempts issued to the current target; drives rotation. */
+    private var attemptsOnTarget = 0
     private var lastNotificationMessage: String? = null
 
     override fun onCreate() {
@@ -119,47 +127,146 @@ class ReconnectService : Service() {
     private fun tick(settings: AppSettings) {
         // Monotonic clock: wall-clock jumps must not stretch or skip the backoff.
         val nowMs = SystemClock.elapsedRealtime()
-        val bt = bluetooth.snapshot(settings.iphoneSelector)
         val association = wifi.association()
-        val snapshot = WorldSnapshot(
-            nowMs = nowMs,
-            configured = settings.isConfigured,
-            targetSsid = settings.hotspotSsid,
-            bluetoothEnabled = bt.enabled,
-            wifiEnabled = wifi.isWifiEnabled(),
-            iphoneBonded = bt.bonded,
-            iphoneLink = bt.link,
-            connectedSsid = association.ssid,
-            wifiAssociated = association.associated,
-            hotspotRequestSatisfied = wifi.isHotspotRequestSatisfied(settings.hotspotSsid, nowMs),
-        )
+        val targets = settings.activeTargets
 
-        val action = engine.onTick(snapshot)
+        // Settings may have changed (entity disabled/removed): drop requests that
+        // no longer belong to an active target instead of letting them run to
+        // their timeout and keep the phone attached to a retired hotspot.
+        wifi.retainOnlyHotspotRequests(targets.map { it.ssid }.toSet())
+
+        if (targets.isEmpty()) {
+            finishTick(
+                phase = Phase.BLOCKED,
+                failures = 0,
+                message = blockMessage(BlockReason.NOT_CONFIGURED),
+                target = null,
+                nowMs = nowMs,
+            )
+            return
+        }
+
+        // Already on one of the configured hotspots? Then that one is active, and
+        // nothing should rotate away from it.
+        val joined = targets.firstOrNull {
+            sameSsid(association.ssid, it.ssid) || wifi.isHotspotRequestSatisfied(it.ssid, nowMs)
+        }
+        if (joined != null) {
+            rotation.select(joined)
+            engine.reset()
+            finishTick(
+                phase = Phase.CONNECTED,
+                failures = 0,
+                message = "On ${joined.displayName}",
+                target = joined,
+                nowMs = nowMs,
+            )
+            lastTargetId = joined.id
+            attemptsOnTarget = 0
+            return
+        }
+
+        var target = rotation.current(targets) ?: targets.first()
+        // A target that disappeared or was disabled is replaced by the rotation;
+        // that replacement must not inherit the previous phone's retry deadline.
+        if (lastTargetId != target.id) {
+            engine.reset()
+            attemptsOnTarget = 0
+        }
+
+        var action: EngineAction = EngineAction.Idle
+        var rotations = 0
+        while (true) {
+            val bt = bluetooth.snapshot(target.btSelector)
+            val snapshot = WorldSnapshot(
+                nowMs = nowMs,
+                configured = true,
+                targetSsid = target.ssid,
+                bluetoothEnabled = bt.enabled,
+                wifiEnabled = wifi.isWifiEnabled(),
+                iphoneBonded = bt.bonded,
+                iphoneLink = bt.link,
+                connectedSsid = association.ssid,
+                wifiAssociated = association.associated,
+                hotspotRequestSatisfied = wifi.isHotspotRequestSatisfied(target.ssid, nowMs),
+            )
+            action = engine.onTick(snapshot)
+
+            val notPaired = action is EngineAction.Blocked &&
+                action.reason == BlockReason.IPHONE_NOT_PAIRED
+            val attemptDue = action == EngineAction.ConnectBluetooth ||
+                action == EngineAction.ConnectHotspot
+            // The engine's failure count is not a per-target attempt counter (it
+            // resets whenever the link changes), so count the requests we issued.
+            // A Bluetooth attempt is the start of a cycle and may rotate at N; a
+            // hotspot request gets one extra slot so the handoff that follows a
+            // successful trigger is never abandoned. Flapping links keep adding to
+            // the counter, so a phone that connects but never yields a hotspot
+            // still hands over eventually.
+            val neededAttempts = if (action == EngineAction.ConnectBluetooth) {
+                settings.rotateAfterAttempts
+            } else {
+                settings.rotateAfterAttempts + 1
+            }
+            val exhausted = attemptDue && attemptsOnTarget >= neededAttempts
+
+            if ((notPaired || exhausted) && rotations < targets.lastIndex) {
+                rotation.advance(targets)
+                engine.reset()
+                attemptsOnTarget = 0
+                rotations++
+                target = rotation.current(targets) ?: target
+                continue
+            }
+            break
+        }
+
         val state = engine.state()
-
+        if (state.phase == Phase.CONNECTED) {
+            // Made it: the next outage gets a fresh rotation budget.
+            attemptsOnTarget = 0
+        }
+        lastTargetId = target.id
         val message = when (action) {
             EngineAction.ConnectBluetooth -> {
-                withWakeLock { bluetooth.requestConnection(settings.iphoneSelector) }
-                "Asking iPhone to connect over Bluetooth"
+                // Only a request the platform accepted counts as an attempt; a
+                // request rejected while the profile is still binding must not
+                // consume the target's budget.
+                val accepted = withWakeLock { bluetooth.requestConnection(target.btSelector) }
+                if (accepted) attemptsOnTarget++
+                "Asking ${target.displayName} to connect over Bluetooth"
             }
 
             EngineAction.ConnectHotspot -> {
-                wifi.requestHotspot(settings.hotspotSsid, settings.hotspotPassword)
-                "Joining ${settings.hotspotSsid}…"
+                val accepted = wifi.requestHotspot(target.ssid, target.password)
+                if (accepted) attemptsOnTarget++
+                "Joining ${target.displayName}…"
             }
 
             is EngineAction.Blocked -> blockMessage(action.reason)
-            EngineAction.Idle -> idleMessage(state.phase, snapshot.connectedSsid, settings)
+            EngineAction.Idle -> idleMessage(state.phase, association.ssid, target)
         }
 
-        val status = ServiceStatus(
-            running = true,
-            phase = state.phase,
-            failures = state.failures,
-            message = message,
-            lastTickMs = snapshot.nowMs,
+        finishTick(state.phase, state.failures, message, target, nowMs)
+    }
+
+    private fun finishTick(
+        phase: Phase,
+        failures: Int,
+        message: String,
+        target: IphoneTarget?,
+        nowMs: Long,
+    ) {
+        publish(
+            ServiceStatus(
+                running = true,
+                phase = phase,
+                failures = failures,
+                message = message,
+                lastTickMs = nowMs,
+                targetLabel = target?.displayName,
+            ),
         )
-        publish(status)
         if (message != lastNotificationMessage) {
             getSystemService(NotificationManager::class.java)
                 ?.notify(NOTIFICATION_ID, buildNotification(message))
@@ -170,21 +277,24 @@ class ReconnectService : Service() {
         // one of them drops the HID link, and every terminal phase except CONNECTED
         // also cancels live hotspot requests. Comparing with lastPhase (not "entering
         // the set") matters: CONNECTED -> BLOCKED must still clean up.
-        if (state.phase in RELEASE_TRIGGER_PHASES && lastPhase != state.phase) {
+        if (phase in RELEASE_TRIGGER_PHASES && lastPhase != phase) {
             bluetooth.disconnectTrigger()
             // On CONNECTED the request's 30s hold is what hands the association to
             // the system's auto-join, so it is left alone there.
-            if (state.phase != Phase.CONNECTED) wifi.cancelHotspotRequests()
+            if (phase != Phase.CONNECTED) wifi.cancelHotspotRequests()
         }
-        lastPhase = state.phase
+        lastPhase = phase
     }
 
-    private fun idleMessage(phase: Phase, connectedSsid: String?, settings: AppSettings): String =
+    private fun sameSsid(a: String?, b: String): Boolean =
+        a != null && b.isNotBlank() && a == b
+
+    private fun idleMessage(phase: Phase, connectedSsid: String?, target: IphoneTarget): String =
         when (phase) {
-            Phase.CONNECTED -> "On ${settings.hotspotSsid}"
+            Phase.CONNECTED -> "On ${target.displayName}"
             Phase.ON_OTHER_WIFI -> "On ${connectedSsid ?: "another network"} — staying idle"
-            Phase.WAITING_FOR_IPHONE -> "Waiting for the next Bluetooth attempt"
-            Phase.WAITING_FOR_HOTSPOT -> "Bluetooth up — waiting for the hotspot"
+            Phase.WAITING_FOR_IPHONE -> "Waiting for the next Bluetooth attempt to ${target.displayName}"
+            Phase.WAITING_FOR_HOTSPOT -> "Bluetooth up — waiting for ${target.displayName}'s hotspot"
             Phase.CONNECTING_HOTSPOT -> "Waiting for the next hotspot attempt"
             Phase.BLOCKED -> "Idle"
         }
@@ -201,11 +311,11 @@ class ReconnectService : Service() {
      * attempt. The connection itself completes asynchronously; the next tick
      * observes the result.
      */
-    private fun withWakeLock(block: () -> Unit) {
+    private fun <T> withWakeLock(block: () -> T): T {
         val power = getSystemService(PowerManager::class.java) ?: return block()
         val lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:attempt")
         runCatching { lock.acquire(WAKE_LOCK_MS) }
-        try {
+        return try {
             block()
         } finally {
             runCatching { if (lock.isHeld) lock.release() }
