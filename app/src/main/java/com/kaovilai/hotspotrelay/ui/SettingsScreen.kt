@@ -277,7 +277,9 @@ fun SettingsScreen(store: SettingsStore) {
                 onClick = {
                     val stored = persist()
                     val wifi = AndroidWifiLink(context)
-                    val complete = stored.targets.filter { it.isComplete }
+                    // Enabled only: a disabled entry must not win the per-SSID
+                    // deduplication and overwrite an enabled target's password.
+                    val complete = stored.targets.filter { it.enabled && it.isComplete }
                     if (complete.isEmpty()) {
                         Toast.makeText(
                             context,
