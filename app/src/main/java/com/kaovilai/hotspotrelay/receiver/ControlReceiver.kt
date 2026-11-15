@@ -130,10 +130,20 @@ class ControlReceiver : BroadcastReceiver() {
             ACTION_MOVE -> {
                 val selector = selectorFrom(intent)
                     ?: return Parsed(error = "MOVE needs one selector: id, ssid, label or index")
+                // Validate every present extra before choosing a branch: a
+                // malformed 'delta' next to a valid 'to' is still a caller bug.
+                if (intent.hasExtra("to") && intExtra(intent, "to") == null) {
+                    return Parsed(error = "MOVE 'to' must be a number")
+                }
+                if (intent.hasExtra("delta") && intExtra(intent, "delta") == null) {
+                    return Parsed(error = "MOVE 'delta' must be a number")
+                }
+                if (intent.hasExtra("to") && intent.hasExtra("delta")) {
+                    return Parsed(error = "MOVE needs either 'to' or 'delta', not both")
+                }
                 when {
                     intent.hasExtra("to") -> {
-                        val to = intExtra(intent, "to")
-                            ?: return Parsed(error = "MOVE 'to' must be a number")
+                        val to = intExtra(intent, "to")!!
                         Parsed(SettingsCommand.Move(selector, to))
                     }
 

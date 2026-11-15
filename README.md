@@ -184,6 +184,8 @@ Rules:
   Each selector matches its own field: `ssid` never matches a label or a
   displayed name, and `id` never matches anything but the entry id; only
   `label` falls back to the displayed name (useful when the label is blank).
+- `MOVE` takes exactly one of `to` or `delta`; supplying both, or a
+  malformed value for either, rejects the command.
 - Malformed commands are rejected with `ok=false`: a missing `enabled`, a
   non-boolean `enabled`, a non-numeric `to`/`delta`/`index`/`value`, or `MOVE`
   without either `to` or `delta`. The app never guesses a default.
