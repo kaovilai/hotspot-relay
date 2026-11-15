@@ -367,6 +367,20 @@ class AndroidWifiLink(private val context: Context) {
         hotspotRequestSatisfiedAtMs = 0L
     }
 
+    /**
+     * Cancels requests whose SSID is no longer one of [ssids]. Called every tick
+     * so disabling or deleting an iPhone takes effect on in-flight requests
+     * immediately instead of waiting for the request timeout.
+     */
+    fun retainOnlyHotspotRequests(ssids: Set<String>) {
+        activeRequests.entries.toList().forEach { (callback, handle) ->
+            if (handle.ssid !in ssids) {
+                activeRequests.remove(callback)
+                runCatching { handle.release() }
+            }
+        }
+    }
+
     private fun cancelRequests(exceptSsid: String?) {
         activeRequests.entries.toList().forEach { (callback, handle) ->
             if (exceptSsid == null || handle.ssid != exceptSsid) {

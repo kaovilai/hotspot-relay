@@ -130,6 +130,11 @@ class ReconnectService : Service() {
         val association = wifi.association()
         val targets = settings.activeTargets
 
+        // Settings may have changed (entity disabled/removed): drop requests that
+        // no longer belong to an active target instead of letting them run to
+        // their timeout and keep the phone attached to a retired hotspot.
+        wifi.retainOnlyHotspotRequests(targets.map { it.ssid }.toSet())
+
         if (targets.isEmpty()) {
             finishTick(
                 phase = Phase.BLOCKED,
