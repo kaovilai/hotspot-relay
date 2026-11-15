@@ -45,15 +45,15 @@ class ReconnectEngineTest {
     }
 
     @Test
-    fun `ssid comparison ignores case and padding`() {
+    fun `ssid matching is exact because ssids are case sensitive`() {
         val engine = ReconnectEngine()
 
         val action = engine.onTick(
-            snapshot(nowMs = 0, connectedSsid = "  passawit's IPHONE "),
+            snapshot(nowMs = 0, connectedSsid = "PASSAWIT'S IPHONE"),
         )
 
         assertEquals(EngineAction.Idle, action)
-        assertEquals(Phase.CONNECTED, engine.state().phase)
+        assertEquals(Phase.ON_OTHER_WIFI, engine.state().phase)
     }
 
     @Test

@@ -70,7 +70,7 @@ class ReconnectService : Service() {
         super.onCreate()
         settingsStore = SettingsStore.get(this)
         bluetooth = AndroidBluetoothLink.get(this).also { it.start() }
-        wifi = AndroidWifiLink(this)
+        wifi = AndroidWifiLink(this).also { it.start() }
         createNotificationChannel()
     }
 
@@ -101,6 +101,7 @@ class ReconnectService : Service() {
     override fun onDestroy() {
         loop?.cancel()
         scope.cancel()
+        wifi.stop()
         bluetooth.stop()
         publish(ServiceStatus(running = false, message = "Stopped"))
         super.onDestroy()
@@ -165,14 +166,13 @@ class ReconnectService : Service() {
             lastNotificationMessage = message
         }
 
-        // The trigger link has done its job as soon as we stop trying to reach the
-        // hotspot: joined, moved to another Wi-Fi, or blocked. Dropping it restores
-        // the phone's own HID host and un-attaches the iPhone keyboard.
-        val wasTryingHotspot = lastPhase == Phase.WAITING_FOR_HOTSPOT ||
-            lastPhase == Phase.CONNECTING_HOTSPOT
-        val tryingHotspot = state.phase == Phase.WAITING_FOR_HOTSPOT ||
-            state.phase == Phase.CONNECTING_HOTSPOT
-        if (wasTryingHotspot && !tryingHotspot) bluetooth.disconnectTrigger()
+        // Windows in which there is nothing left to trigger. Entering one of these
+        // drops the HID link: joined, moved to another Wi-Fi, or blocked. Using the
+        // target phase (not "was trying") keeps this from tearing down a fresh
+        // Bluetooth retry right after the link drops.
+        if (state.phase in RELEASE_TRIGGER_PHASES && lastPhase !in RELEASE_TRIGGER_PHASES) {
+            bluetooth.disconnectTrigger()
+        }
         lastPhase = state.phase
     }
 
@@ -286,5 +286,11 @@ class ReconnectService : Service() {
             SettingsStore.get(context).update { it.copy(serviceEnabled = false) }
             context.stopService(Intent(context, ReconnectService::class.java))
         }
+
+        private val RELEASE_TRIGGER_PHASES = setOf(
+            Phase.CONNECTED,
+            Phase.ON_OTHER_WIFI,
+            Phase.BLOCKED,
+        )
     }
 }

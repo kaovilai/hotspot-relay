@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.kaovilai.hotspotrelay.core.LinkStatus
@@ -266,9 +267,17 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         }
     }
 
-    private fun hasConnectPermission(): Boolean =
-        ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
+    private fun hasConnectPermission(): Boolean {
+        // BLUETOOTH_CONNECT only exists from Android 12; on API 29-30 the legacy
+        // BLUETOOTH permission is what grants access to paired devices.
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Manifest.permission.BLUETOOTH_CONNECT
+        } else {
+            Manifest.permission.BLUETOOTH
+        }
+        return ContextCompat.checkSelfPermission(context, permission) ==
             PackageManager.PERMISSION_GRANTED
+    }
 
     companion object {
         private const val TAG = "HotspotRelay/Bt"

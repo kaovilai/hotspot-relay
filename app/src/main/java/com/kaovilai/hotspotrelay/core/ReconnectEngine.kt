@@ -249,6 +249,11 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
         connectingSinceMs = null
     }
 
+    /**
+     * SSIDs are case-sensitive and may contain meaningful spaces, so this is an
+     * exact comparison. [WorldSnapshot.connectedSsid] is stripped of the quotes
+     * Android adds and the target is trimmed when saved.
+     */
     private fun sameSsid(a: String?, b: String): Boolean =
-        a != null && b.isNotBlank() && a.trim().equals(b.trim(), ignoreCase = true)
+        a != null && b.isNotBlank() && a == b
 }

@@ -107,6 +107,11 @@ fun SettingsScreen(store: SettingsStore) {
         hotspotPassword = stored.hotspotPassword
         tickSeconds = (stored.tickIntervalMs / 1000).toString()
         autoStartOnBoot = stored.autoStartOnBoot
+        // Keep Android's suggestion in sync with edited credentials; otherwise the
+        // system would keep auto-joining with the old password.
+        if (stored.hotspotSsid.isNotBlank()) {
+            AndroidWifiLink(context).ensureSuggestion(stored.hotspotSsid, stored.hotspotPassword)
+        }
         Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
     }
 
@@ -324,7 +329,11 @@ private fun suggestionMessage(outcome: SuggestionOutcome): String = when (outcom
 }
 
 private fun requiredPermissions(): Array<String> {
-    val permissions = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION)
+    // Android 12+ ignores a fine-location request that is not paired with coarse.
+    val permissions = mutableListOf(
+        Manifest.permission.ACCESS_COARSE_LOCATION,
+        Manifest.permission.ACCESS_FINE_LOCATION,
+    )
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         permissions += Manifest.permission.BLUETOOTH_CONNECT
         permissions += Manifest.permission.BLUETOOTH_ADVERTISE
