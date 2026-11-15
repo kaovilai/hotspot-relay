@@ -18,6 +18,7 @@ import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.kaovilai.hotspotrelay.core.DropEpisodes
 import com.kaovilai.hotspotrelay.core.HidConnectionPolicy
 import com.kaovilai.hotspotrelay.core.LinkStatus
 import com.kaovilai.hotspotrelay.core.PendingDrops
@@ -148,6 +149,9 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
      */
     private val pendingDrops = PendingDrops()
 
+    /** Peers whose current drop episode was already reported to the engine. */
+    private val dropEpisodes = DropEpisodes()
+
     /** Device currently probed by "Check iPhone pairing" (not the service target). */
     @Volatile
     private var probeAddress: String? = null
@@ -172,6 +176,8 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             // reconnect of a remembered keyboard must never linger either.
             when (state) {
                 BluetoothProfile.STATE_CONNECTED -> {
+                    // A new link starts a new drop episode for this peer.
+                    dropEpisodes.forget(device.address)
                     connectedAddresses.add(device.address)
                     scheduleEnforcement()
                 }
@@ -213,6 +219,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         allowedUntilMs = 0
         connectedAddresses.clear()
         pendingDrops.publish(emptyList())
+        dropEpisodes.clear()
         policyDrops.clear()
         unregisterHid()
         val hid = hidDevice
@@ -523,6 +530,17 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                     val now = SystemClock.elapsedRealtime()
                     val addresses = connectedAddresses.toList()
                     if (addresses.isEmpty()) {
+                        if (HidConnectionPolicy.isAllowed(now, allowedUntilMs)) {
+                            // An empty set does not rule out a connection in flight
+                            // (a trigger attempt or pairing probe already accepted).
+                            // Unregistering here would break it; re-check at the
+                            // window's end instead.
+                            repostEnforcement(
+                                this,
+                                HidConnectionPolicy.nextCheckDelayMs(now, allowedUntilMs),
+                            )
+                            return
+                        }
                         finishEnforcement(this)
                         unregisterHid()
                         return
@@ -536,7 +554,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                         // Only a drop of the service's own target counts; a stray
                         // remembered peer must not make the engine keep its backoff.
                         val target = hidTargetAddress
-                        if (target != null && target in denied && !pendingDrops.contains(target)) {
+                        if (target != null && target in denied && dropEpisodes.markReported(target)) {
                             policyDrops.record()
                         }
                         pendingDrops.publish(denied)
