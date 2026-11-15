@@ -232,6 +232,16 @@ class AndroidWifiLink(private val context: Context) {
         }
     }
 
+    /**
+     * Revokes the auto-join suggestion for an SSID that is no longer configured.
+     * Only possible where suggestions can be enumerated (API 30+); on API 29 the
+     * platform offers no way to look them up, so this is a no-op there.
+     */
+    fun forgetSuggestion(ssid: String) {
+        if (ssid.isBlank()) return
+        removeSuggestions(ssid)
+    }
+
     private fun removeSuggestions(ssid: String) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
         val existing = runCatching { wifi?.getNetworkSuggestions().orEmpty() }
@@ -252,22 +262,22 @@ class AndroidWifiLink(private val context: Context) {
      * The request is released after [holdMs] so the system falls back to its own
      * auto-join decision (the suggestion registered above).
      */
-    fun requestHotspot(ssid: String, passphrase: String, holdMs: Long = REQUEST_HOLD_MS) {
-        val manager = connectivity ?: return
+    fun requestHotspot(ssid: String, passphrase: String, holdMs: Long = REQUEST_HOLD_MS): Boolean {
+        val manager = connectivity ?: return false
         if (stopped) {
             Log.i(TAG, "ignoring hotspot request after stop")
-            return
+            return false
         }
         if (ssid.isBlank() || passphrase.isEmpty()) {
             Log.w(TAG, "refusing hotspot request without an SSID and password")
-            return
+            return false
         }
 
         // Last-moment guard: never pull the phone off a network it is happily on.
         val current = association()
         if (current.associated && current.ssid != null && current.ssid != ssid) {
             Log.i(TAG, "not requesting hotspot while associated with ${current.ssid}")
-            return
+            return false
         }
 
         // Obsolete requests for other targets must not keep running.
@@ -279,7 +289,7 @@ class AndroidWifiLink(private val context: Context) {
                 .setWpa2Passphrase(passphrase)
                 .build()
         }.onFailure { Log.w(TAG, "cannot build specifier", it) }
-            .getOrNull() ?: return
+            .getOrNull() ?: return false
 
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -336,12 +346,13 @@ class AndroidWifiLink(private val context: Context) {
             .isSuccess
         if (!accepted) {
             activeRequests.remove(callback)
-            return
+            return false
         }
 
         // The no-timeout overload exists on all supported API levels; enforce the
         // timeout ourselves. onAvailable reschedules this to the shorter hold.
         mainHandler.postDelayed(releaseRunnable, REQUEST_TIMEOUT_MS)
+        return true
     }
 
     /**

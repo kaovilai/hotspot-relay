@@ -107,6 +107,15 @@ fun SettingsScreen(store: SettingsStore) {
                 autoStartOnBoot = autoStartOnBoot,
             )
         }
+        // Reconcile suggestions: a deleted or cleared entry's SSID would
+        // otherwise stay auto-joined forever. Removal is API 30+ (enumeration
+        // is unavailable before that) and silent if there is nothing to remove.
+        val keepSsids = stored.targets.filter { it.enabled && it.isComplete }
+            .map { it.ssid }.toSet()
+        val stale = saved.targets.map { it.ssid }
+            .filter { it.isNotBlank() && it !in keepSsids }.toSet()
+        stale.forEach { ssid -> runCatching { AndroidWifiLink(context).forgetSuggestion(ssid) } }
+
         rows = stored.targets
         rotateAfter = stored.rotateAfterAttempts.toString()
         tickSeconds = (stored.tickIntervalMs / 1000).toString()

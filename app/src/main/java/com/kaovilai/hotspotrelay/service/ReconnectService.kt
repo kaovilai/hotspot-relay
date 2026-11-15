@@ -19,6 +19,7 @@ import com.kaovilai.hotspotrelay.MainActivity
 import com.kaovilai.hotspotrelay.R
 import com.kaovilai.hotspotrelay.core.BlockReason
 import com.kaovilai.hotspotrelay.core.EngineAction
+import com.kaovilai.hotspotrelay.core.LinkStatus
 import com.kaovilai.hotspotrelay.core.Phase
 import com.kaovilai.hotspotrelay.core.ReconnectEngine
 import com.kaovilai.hotspotrelay.core.TargetRotation
@@ -72,6 +73,7 @@ class ReconnectService : Service() {
     private var lastTargetId: String? = null
     /** Attempts issued to the current target; drives rotation. */
     private var attemptsOnTarget = 0
+    private var lastLinkStatus: LinkStatus = LinkStatus.DISCONNECTED
     private var lastNotificationMessage: String? = null
 
     override fun onCreate() {
@@ -187,6 +189,14 @@ class ReconnectService : Service() {
             )
             action = engine.onTick(snapshot)
 
+            // Establishing the Bluetooth link is progress: the hotspot handoff
+            // should not be charged against the same per-target budget, or a
+            // rotate-after-1 setup would abandon the phone right at that point.
+            if (bt.link == LinkStatus.CONNECTED && lastLinkStatus != LinkStatus.CONNECTED) {
+                attemptsOnTarget = 0
+            }
+            lastLinkStatus = bt.link
+
             val notPaired = action is EngineAction.Blocked &&
                 action.reason == BlockReason.IPHONE_NOT_PAIRED
             val attemptDue = action == EngineAction.ConnectBluetooth ||
@@ -201,6 +211,7 @@ class ReconnectService : Service() {
                 rotation.advance(targets)
                 engine.reset()
                 attemptsOnTarget = 0
+                lastLinkStatus = LinkStatus.DISCONNECTED
                 rotations++
                 target = rotation.current(targets) ?: target
                 continue
@@ -209,9 +220,6 @@ class ReconnectService : Service() {
         }
 
         val state = engine.state()
-        if (action == EngineAction.ConnectBluetooth || action == EngineAction.ConnectHotspot) {
-            attemptsOnTarget++
-        }
         if (state.phase == Phase.CONNECTED) {
             // Made it: the next outage gets a fresh rotation budget.
             attemptsOnTarget = 0
@@ -219,12 +227,17 @@ class ReconnectService : Service() {
         lastTargetId = target.id
         val message = when (action) {
             EngineAction.ConnectBluetooth -> {
-                withWakeLock { bluetooth.requestConnection(target.btSelector) }
+                // Only a request the platform accepted counts as an attempt; a
+                // request rejected while the profile is still binding must not
+                // consume the target's budget.
+                val accepted = withWakeLock { bluetooth.requestConnection(target.btSelector) }
+                if (accepted) attemptsOnTarget++
                 "Asking ${target.displayName} to connect over Bluetooth"
             }
 
             EngineAction.ConnectHotspot -> {
-                wifi.requestHotspot(target.ssid, target.password)
+                val accepted = wifi.requestHotspot(target.ssid, target.password)
+                if (accepted) attemptsOnTarget++
                 "Joining ${target.displayName}…"
             }
 
@@ -296,11 +309,11 @@ class ReconnectService : Service() {
      * attempt. The connection itself completes asynchronously; the next tick
      * observes the result.
      */
-    private fun withWakeLock(block: () -> Unit) {
+    private fun <T> withWakeLock(block: () -> T): T {
         val power = getSystemService(PowerManager::class.java) ?: return block()
         val lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:attempt")
         runCatching { lock.acquire(WAKE_LOCK_MS) }
-        try {
+        return try {
             block()
         } finally {
             runCatching { if (lock.isHeld) lock.release() }
