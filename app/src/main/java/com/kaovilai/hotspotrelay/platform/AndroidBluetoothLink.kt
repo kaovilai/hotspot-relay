@@ -8,11 +8,16 @@ import android.bluetooth.BluetoothHidDevice
 import android.bluetooth.BluetoothHidDeviceAppSdpSettings
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.kaovilai.hotspotrelay.core.HidConnectionPolicy
 import com.kaovilai.hotspotrelay.core.LinkStatus
 
 data class BluetoothSnapshot(
@@ -77,6 +82,22 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     @Volatile
     private var stopped = true
 
+    /**
+     * A HID link is only allowed until this monotonic time. iOS hides its
+     * on-screen keyboard while a hardware keyboard is connected and may
+     * re-connect the remembered one by itself, so an explicit reconnect attempt
+     * opens a short window and everything outside it is dropped. The bond stays,
+     * so the next trigger does not need re-pairing.
+     */
+    @Volatile
+    private var allowedUntilMs = 0L
+
+    @Volatile
+    private var pairingMode = false
+
+    private var bondReceiver: BroadcastReceiver? = null
+    private var enforcement: Runnable? = null
+
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
             hidRegistered = registered
@@ -84,13 +105,21 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         }
 
         override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
-            if (device.address != hidTargetAddress) return
-            hidLink = when (state) {
-                BluetoothProfile.STATE_CONNECTED -> LinkStatus.CONNECTED
-                BluetoothProfile.STATE_CONNECTING -> LinkStatus.CONNECTING
-                else -> LinkStatus.DISCONNECTED
+            if (device.address == hidTargetAddress) {
+                hidLink = when (state) {
+                    BluetoothProfile.STATE_CONNECTED -> LinkStatus.CONNECTED
+                    BluetoothProfile.STATE_CONNECTING -> LinkStatus.CONNECTING
+                    else -> LinkStatus.DISCONNECTED
+                }
             }
-            Log.i(TAG, "HID link state=$state")
+            Log.i(TAG, "HID link state=$state for ${device.address}")
+            // Enforce the window even for a device we did not target yet: during
+            // pairing there is no configured selector, and the iPhone's own
+            // reconnect of a remembered keyboard must never linger either.
+            when (state) {
+                BluetoothProfile.STATE_CONNECTED -> scheduleEnforcement(device)
+                BluetoothProfile.STATE_DISCONNECTED -> cancelEnforcement()
+            }
         }
     }
 
@@ -121,6 +150,8 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
 
     fun stop() {
         stopped = true
+        endPairingMode()
+        allowedUntilMs = 0
         unregisterHid()
         val hid = hidDevice
         if (hid != null) {
@@ -185,6 +216,13 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         val adapter = adapter ?: return false
         if (!adapter.isEnabled) return false
 
+        // Every attempt re-opens the window; the enforcement loop drops the link
+        // once the last attempt's window has passed.
+        allowedUntilMs = HidConnectionPolicy.allowedUntil(
+            SystemClock.elapsedRealtime(),
+            HidConnectionPolicy.TRIGGER_WINDOW_MS,
+        )
+
         val device = findDevice(selector) ?: return false
         hidTargetAddress = device.address
 
@@ -225,6 +263,13 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         val adapter = adapter ?: return PairingModeResult.UNAVAILABLE
         if (!adapter.isEnabled) return PairingModeResult.UNAVAILABLE
 
+        pairingMode = true
+        allowedUntilMs = HidConnectionPolicy.allowedUntil(
+            SystemClock.elapsedRealtime(),
+            HidConnectionPolicy.PAIRING_WINDOW_MS,
+        )
+        watchBondState()
+
         start()
         val hid = hidDevice ?: return PairingModeResult.NOT_READY
         if (!hidRegistered) {
@@ -232,9 +277,11 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             // Registration lands in onAppStatusChanged; the caller retries.
             return PairingModeResult.NOT_READY
         }
-        // Bound how long a pairing-only registration may keep the phone's HID
-        // host disabled; the service re-registers on demand during attempts.
-        mainHandler.postDelayed({ unregisterHid() }, PAIRING_REGISTRATION_TTL_MS)
+        // Backstop only: the bond-state receiver ends pairing mode as soon as the
+        // iPhone actually pairs, so the keyboard is not left attached for the
+        // whole discoverability window.
+        mainHandler.removeCallbacks(pairingTimeout)
+        mainHandler.postDelayed(pairingTimeout, PAIRING_REGISTRATION_TTL_MS)
         return PairingModeResult.READY
     }
 
@@ -243,6 +290,8 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
      * (which frees the phone's HID host again) and disconnects the link.
      */
     fun disconnectTrigger() {
+        allowedUntilMs = 0
+        cancelEnforcement()
         val address = hidTargetAddress
         val hid = hidDevice
         if (hid != null && address != null && hasConnectPermission()) {
@@ -255,6 +304,181 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         unregisterHid()
         hidLink = LinkStatus.DISCONNECTED
     }
+
+    /**
+     * Opens one short window and reports whether iOS really accepts a keyboard
+     * link. Diagnoses an iPhone that was paired before the app's keyboard-mode
+     * pairing: iOS never added the HID service then, so `connect()` can be
+     * accepted but never come up.
+     */
+    fun probePairing(
+        selector: String,
+        timeoutMs: Long = PROBE_TIMEOUT_MS,
+        onResult: (Boolean) -> Unit,
+    ) {
+        start()
+        val adapter = adapter
+        val device = findDevice(selector)
+        if (adapter == null || !adapter.isEnabled || device == null) {
+            onResult(false)
+            return
+        }
+        hidTargetAddress = device.address
+        allowedUntilMs = HidConnectionPolicy.allowedUntil(
+            SystemClock.elapsedRealtime(),
+            HidConnectionPolicy.TRIGGER_WINDOW_MS,
+        )
+        val deadline = SystemClock.elapsedRealtime() + timeoutMs
+        var connectRequested = false
+        val poll = object : Runnable {
+            override fun run() {
+                // The HID proxy binds asynchronously; keep polling for it instead
+                // of reporting a false negative on the first tap.
+                val hid = hidDevice
+                if (hid == null) {
+                    if (SystemClock.elapsedRealtime() >= deadline) {
+                        onResult(false)
+                        return
+                    }
+                    mainHandler.postDelayed(this, PROBE_POLL_MS)
+                    return
+                }
+                if (!hidRegistered) registerHid(hid)
+                if (!connectRequested) {
+                    connectRequested = true
+                    runCatching { hid.connect(device) }
+                        .onFailure { Log.w(TAG, "probe HID connect failed", it) }
+                }
+
+                val state = runCatching { hid.getConnectionState(device) }
+                    .getOrDefault(BluetoothProfile.STATE_DISCONNECTED)
+                when {
+                    state == BluetoothProfile.STATE_CONNECTED -> {
+                        onResult(true)
+                        // Never leave the keyboard attached after the check.
+                        mainHandler.postDelayed(
+                            { dropLink(device) },
+                            HidConnectionPolicy.GRACE_MS,
+                        )
+                    }
+
+                    SystemClock.elapsedRealtime() >= deadline -> {
+                        onResult(false)
+                        dropLink(device)
+                    }
+
+                    else -> mainHandler.postDelayed(this, PROBE_POLL_MS)
+                }
+            }
+        }
+        mainHandler.postDelayed(poll, PROBE_POLL_MS)
+    }
+
+    /**
+     * Re-checks the allowed window while a link is up. Every attempt extends the
+     * window; once it has passed (plus a short grace) the link is dropped and the
+     * HID app unregistered, so no keyboard can stay attached.
+     */
+    private fun scheduleEnforcement(device: BluetoothDevice) {
+        cancelEnforcement()
+        val check = object : Runnable {
+            override fun run() {
+                val now = SystemClock.elapsedRealtime()
+                if (!HidConnectionPolicy.isAllowed(now, allowedUntilMs)) {
+                    Log.i(TAG, "dropping HID link: trigger window expired")
+                    enforcement = null
+                    dropLink(device)
+                } else {
+                    mainHandler.postDelayed(
+                        this,
+                        HidConnectionPolicy.nextCheckDelayMs(now, allowedUntilMs),
+                    )
+                }
+            }
+        }
+        enforcement = check
+        mainHandler.postDelayed(check, HidConnectionPolicy.GRACE_MS)
+    }
+
+    private fun cancelEnforcement() {
+        enforcement?.let { mainHandler.removeCallbacks(it) }
+        enforcement = null
+    }
+
+    private fun dropLink(device: BluetoothDevice) {
+        val hid = hidDevice
+        if (hid != null) {
+            runCatching { hid.disconnect(device) }
+                .onFailure { Log.w(TAG, "HID disconnect failed", it) }
+        }
+        hidLink = LinkStatus.DISCONNECTED
+        unregisterHid()
+    }
+
+    private val pairingTimeout = Runnable { endPairingMode() }
+
+    /**
+     * Leaves pairing mode without leaving a keyboard attached. The bond itself is
+     * kept — iOS remembers it, so the next trigger connects without re-pairing.
+     */
+    private fun endPairingMode(device: BluetoothDevice? = null) {
+        pairingMode = false
+        allowedUntilMs = 0
+        mainHandler.removeCallbacks(pairingTimeout)
+        cancelEnforcement()
+        stopBondWatch()
+        if (device != null) dropLink(device) else unregisterHid()
+    }
+
+    /**
+     * Ends pairing mode as soon as the iPhone completes the bond, instead of
+     * waiting out the discoverability window with a keyboard attached.
+     */
+    private fun watchBondState() {
+        if (bondReceiver != null) return
+        val listener = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (!pairingMode) return
+                val state = intent.getIntExtra(
+                    BluetoothDevice.EXTRA_BOND_STATE,
+                    BluetoothDevice.BOND_NONE,
+                )
+                if (state != BluetoothDevice.BOND_BONDED) return
+                val device = intent.deviceExtra() ?: return
+                mainHandler.postDelayed(
+                    { endPairingMode(device) },
+                    HidConnectionPolicy.PAIRING_DROP_DELAY_MS,
+                )
+            }
+        }
+        val registered = runCatching {
+            // BOND_STATE_CHANGED is sent by the Bluetooth process, so the receiver
+            // has to be exported; the action is protected, apps cannot spoof it.
+            ContextCompat.registerReceiver(
+                context.applicationContext,
+                listener,
+                IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
+                ContextCompat.RECEIVER_EXPORTED,
+            )
+        }.onFailure { Log.w(TAG, "cannot watch bond state", it) }
+            .isSuccess
+        if (registered) bondReceiver = listener
+    }
+
+    private fun stopBondWatch() {
+        bondReceiver?.let {
+            runCatching { context.applicationContext.unregisterReceiver(it) }
+        }
+        bondReceiver = null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun Intent.deviceExtra(): BluetoothDevice? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+        } else {
+            getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+        }
 
     private fun registerHid(hid: BluetoothHidDevice) {
         if (stopped) return
@@ -330,6 +554,11 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
 
         /** How long a pairing-mode registration may keep the HID host borrowed. */
         private const val PAIRING_REGISTRATION_TTL_MS = 120_000L
+
+        /** How long "Check iPhone pairing" waits for a HID link. */
+        private const val PROBE_TIMEOUT_MS = 8_000L
+
+        private const val PROBE_POLL_MS = 500L
 
         /** Standard boot-keyboard HID report descriptor; the iPhone just needs a valid HID device. */
         private val KEYBOARD_DESCRIPTOR: ByteArray = hexBytes(
