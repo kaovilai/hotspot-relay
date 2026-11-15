@@ -103,6 +103,7 @@ fun SettingsScreen(store: SettingsStore) {
     var pickerScanning by remember { mutableStateOf(false) }
     var pickerIsScan by remember { mutableStateOf(false) }
     var pickerNotice by remember { mutableStateOf<String?>(null) }
+    var pairingCheckRunning by remember { mutableStateOf(false) }
     val scanPermissionName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         "Nearby devices"
     } else {
@@ -407,6 +408,50 @@ fun SettingsScreen(store: SettingsStore) {
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Pair with iPhone (keyboard mode)") }
+
+            OutlinedButton(
+                onClick = {
+                    val selector = rows.firstOrNull { it.enabled && it.btSelector.isNotBlank() }
+                        ?.btSelector
+                        ?: rows.firstOrNull { it.btSelector.isNotBlank() }?.btSelector
+                    if (selector.isNullOrBlank()) {
+                        Toast.makeText(
+                            context,
+                            "Add an iPhone entry with its Bluetooth name or MAC first",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@OutlinedButton
+                    }
+                    if (status.running) {
+                        // The loop shares the single HID registration; its own
+                        // trigger/release would tear the probe down mid-check.
+                        Toast.makeText(
+                            context,
+                            "Stop the reconnect loop first — it can interrupt the pairing check",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@OutlinedButton
+                    }
+                    pairingCheckRunning = true
+                    bluetooth.probePairing(selector) { connected ->
+                        pairingCheckRunning = false
+                        Toast.makeText(
+                            context,
+                            if (connected) {
+                                "Keyboard link works — it was disconnected again so the iPhone keyboard stays visible"
+                            } else {
+                                "No keyboard link. If this iPhone was paired before keyboard mode: " +
+                                    "Settings → Bluetooth → forget this phone, then pair again here."
+                            },
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                },
+                enabled = !pairingCheckRunning,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(if (pairingCheckRunning) "Checking pairing…" else "Check iPhone pairing")
+            }
 
             FilledTonalButton(
                 onClick = {

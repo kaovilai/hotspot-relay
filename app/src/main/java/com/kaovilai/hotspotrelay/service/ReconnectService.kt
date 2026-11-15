@@ -205,6 +205,7 @@ class ReconnectService : Service() {
                 connectedSsid = association.ssid,
                 wifiAssociated = association.associated,
                 hotspotRequestSatisfied = wifi.isHotspotRequestSatisfied(target.ssid, nowMs),
+                linkDroppedByPolicy = bt.droppedByPolicy,
             )
             action = engine.onTick(snapshot)
 

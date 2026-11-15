@@ -71,8 +71,15 @@ Or grab the APK from [Releases](../../releases/latest).
    registers the phone as a keyboard; if it says "Try again in a second", tap
    once more — the phone becomes discoverable and advertises a keyboard. On the
    iPhone: **Settings → Bluetooth → tap this phone** and confirm the pairing
-   code. The iPhone should list it as a keyboard-like device.
+   code. The iPhone should list it as a keyboard-like device. Pairing ends as
+   soon as the bond completes: the app disconnects the keyboard right away (and
+   keeps the bond), so iOS does not end up with a permanently attached keyboard.
    **Repeat this for every iPhone you add** — an unpaired iPhone is skipped.
+   If an iPhone was paired to this Android phone **before** keyboard mode (for
+   example via Android's own Bluetooth screen), iOS never learned the keyboard
+   service and the trigger cannot come up. Tap **Check iPhone pairing**: on
+   success it disconnects again immediately; on failure, forget the phone on the
+   iPhone and pair again with **Pair with iPhone (keyboard mode)**.
 3. Add one entry per iPhone: **Add iPhone**, then fill in the iPhone's
    Bluetooth name (or MAC), **hotspot SSID** and **hotspot password**.
    **Pick paired** lists the phones already bonded to this device; **Scan
@@ -228,8 +235,22 @@ event for `com.kaovilai.hotspotrelay.action.STATE_CHANGED` and read
   HID device (pairing, or while trying to reach the iPhone), the phone's HID
   *host* service is disabled, so a Bluetooth mouse/keyboard will not work. It is
   restored as soon as the hotspot is joined or the service stops.
-- **The iPhone shows a keyboard attached** while the link is up; it detaches
-  after the hotspot is joined.
+- **The iPhone may briefly show a keyboard attached** while an attempt is
+  running; iOS hides its on-screen keyboard during that moment. The link is
+  never allowed to outlive its trigger window: it is dropped as soon as the
+  hotspot is joined, right after a pairing completes, and at the latest about a
+  minute after the last attempt (a background check enforces this even if no
+  further Bluetooth event arrives, and a partial wakelock is held only while
+  that check is pending, so it also fires with the screen off). An unsolicited
+  re-connect of the remembered keyboard is dropped within seconds. After a
+  window drop the loop backs off (15 s → 300 s) instead of re-arming right away,
+  so a failing trigger does not keep the keyboard attached in a loop. The
+  **bond is kept**, so the next trigger connects without re-pairing.
+- **Why a keyboard and not a mouse.** A HID mouse would sidestep the iPhone's
+  keyboard suppression, but classic-Bluetooth mouse support on iOS is only
+  available through AssistiveTouch and is not verified here; a keyboard is the
+  reliable trigger. Instead of changing the device class, the app guarantees the
+  keyboard link is short-lived.
 - **Wi-Fi joining is mediated by Android.** The app cannot force a network; it
   relies on the approved suggestion plus a short `requestNetwork` for the exact
   SSID. If the system refuses either, the retry loop cannot help.
