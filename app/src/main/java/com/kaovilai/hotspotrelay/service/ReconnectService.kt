@@ -172,6 +172,7 @@ class ReconnectService : Service() {
         // Bluetooth retry right after the link drops.
         if (state.phase in RELEASE_TRIGGER_PHASES && lastPhase !in RELEASE_TRIGGER_PHASES) {
             bluetooth.disconnectTrigger()
+            wifi.cancelHotspotRequests()
         }
         lastPhase = state.phase
     }

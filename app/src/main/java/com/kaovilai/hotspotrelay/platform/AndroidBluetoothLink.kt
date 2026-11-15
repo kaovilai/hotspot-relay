@@ -71,6 +71,10 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     @Volatile
     private var hidTargetAddress: String? = null
 
+    /** True until start(); guards against a tick that races past service teardown. */
+    @Volatile
+    private var stopped = true
+
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
             hidRegistered = registered
@@ -104,6 +108,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     }
 
     fun start() {
+        stopped = false
         if (!hasConnectPermission()) return
         val adapter = adapter ?: return
         if (!adapter.isEnabled) return
@@ -113,6 +118,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     }
 
     fun stop() {
+        stopped = true
         unregisterHid()
         val hid = hidDevice
         if (hid != null) {
@@ -166,6 +172,10 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
      * Returns true when the HID connect request was accepted.
      */
     fun requestConnection(selector: String): Boolean {
+        if (stopped) {
+            Log.i(TAG, "ignoring Bluetooth request after stop")
+            return false
+        }
         if (!hasConnectPermission()) return false
         val adapter = adapter ?: return false
         if (!adapter.isEnabled) return false
@@ -229,6 +239,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     }
 
     private fun registerHid(hid: BluetoothHidDevice) {
+        if (stopped) return
         val sdp = BluetoothHidDeviceAppSdpSettings(
             "Hotspot Relay",
             "Turns on the iPhone hotspot trigger",

@@ -60,6 +60,10 @@ class AndroidWifiLink(private val context: Context) {
     @Volatile
     private var trackingRegistered = false
 
+    /** True until start(); guards against a tick that races past service teardown. */
+    @Volatile
+    private var stopped = true
+
     @Volatile
     private var hotspotRequestSatisfiedAtMs: Long = 0L
 
@@ -84,6 +88,7 @@ class AndroidWifiLink(private val context: Context) {
     }
 
     fun start() {
+        stopped = false
         if (trackingRegistered) return
         val manager = connectivity ?: return
         // The flags overload that would include location info in capabilities is a
@@ -95,6 +100,7 @@ class AndroidWifiLink(private val context: Context) {
     }
 
     fun stop() {
+        stopped = true
         if (trackingRegistered) {
             trackingRegistered = false
             runCatching { connectivity?.unregisterNetworkCallback(wifiCallback) }
@@ -248,6 +254,10 @@ class AndroidWifiLink(private val context: Context) {
      */
     fun requestHotspot(ssid: String, passphrase: String, holdMs: Long = REQUEST_HOLD_MS) {
         val manager = connectivity ?: return
+        if (stopped) {
+            Log.i(TAG, "ignoring hotspot request after stop")
+            return
+        }
         if (ssid.isBlank() || passphrase.isEmpty()) {
             Log.w(TAG, "refusing hotspot request without an SSID and password")
             return
@@ -325,6 +335,18 @@ class AndroidWifiLink(private val context: Context) {
         // The no-timeout overload exists on all supported API levels; enforce the
         // timeout ourselves. onAvailable reschedules this to the shorter hold.
         mainHandler.postDelayed(releaseRunnable, REQUEST_TIMEOUT_MS)
+    }
+
+    /**
+     * Cancels every live hotspot request. Used when the engine stops trying to
+     * reach the hotspot, so a pending app-scoped request cannot connect (or keep
+     * a system prompt up) while the app reports idle.
+     */
+    fun cancelHotspotRequests() {
+        cancelRequests(exceptSsid = null)
+        satisfiedNetwork = null
+        satisfiedSsid = null
+        hotspotRequestSatisfiedAtMs = 0L
     }
 
     private fun cancelRequests(exceptSsid: String?) {
