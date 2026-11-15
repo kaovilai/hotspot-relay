@@ -6,6 +6,8 @@ Keeps an Android phone connected to an iPhone's Personal Hotspot without any
 taps. When the Android phone is away from Wi-Fi, it wakes the iPhone up over
 Bluetooth; an iOS Shortcut reacts to that Bluetooth connection by switching
 Personal Hotspot on; the app then joins the hotspot, retrying until it works.
+Several iPhones can be configured: the list is an ordered priority list, and the
+loop rotates to the next one (round-robin when the limit is 1).
 
 - Android app: Kotlin + Jetpack Compose, foreground service, no ads, no network
   calls.
@@ -68,13 +70,32 @@ Or grab the APK from [Releases](../../releases/latest).
    once more — the phone becomes discoverable and advertises a keyboard. On the
    iPhone: **Settings → Bluetooth → tap this phone** and confirm the pairing
    code. The iPhone should list it as a keyboard-like device.
-3. Enter the **iPhone Bluetooth name** (or its MAC), the **hotspot SSID**
-   (default is `<iPhone name>'s iPhone`), and the **hotspot password**.
-4. Tap **Allow hotspot auto-join** and approve the system dialog. This registers
-   the hotspot as a network suggestion so Android can auto-join it later.
-5. Tap **Allow background battery use** and allow the exemption, otherwise
+3. Add one entry per iPhone: **Add iPhone**, then fill in the iPhone's
+   Bluetooth name (or MAC), **hotspot SSID** (default is
+   `<iPhone name>'s iPhone`) and **hotspot password**. Use **↑ / ↓** to set
+   priority and the switch to enable or disable an entry.
+4. Set **Move to the next iPhone after N failed attempts**: `1` behaves as
+   round-robin, higher values give the first iPhone a longer turn (priority).
+5. Tap **Allow hotspot auto-join for all iPhones** and approve the system
+   dialog. This registers every complete entry as a network suggestion so
+   Android can auto-join later.
+6. Tap **Allow background battery use** and allow the exemption, otherwise
    Android may throttle the service.
-6. Tap **Start**. A low-priority notification shows what the loop is doing.
+7. Tap **Start**. A low-priority notification shows what the loop is doing and
+   which iPhone it is currently targeting.
+
+### Multiple iPhones
+
+- The list is ordered. The first enabled, fully configured entry is tried
+  first; after N failed attempts the loop moves to the next one and wraps
+  around.
+- An iPhone that is not paired (missing from the Bluetooth bonded list) is
+  skipped immediately, without using up its attempts.
+- If the phone is already on **any** configured hotspot — or the app's own
+  request to it came up — that iPhone becomes the active target and no
+  rotation happens.
+- Disabled entries are simply excluded from the rotation, so you can turn one
+  off without deleting it.
 
 ### On the iPhone
 
@@ -105,16 +126,18 @@ and save.
 ## How it decides
 
 `ReconnectEngine` is plain Kotlin with no Android imports, so every rule is
-unit-tested (`./gradlew testDebugUnitTest`, 23 tests). Each tick:
+unit-tested (`./gradlew testDebugUnitTest`, 38 tests). Each tick:
 
 | World state | Action |
 | --- | --- |
-| Associated with the hotspot SSID (or our own request to it came up) | idle, report connected |
+| Associated with any configured hotspot SSID (or our own request to it came up) | idle, report that iPhone as connected |
 | Associated with any other SSID — including one whose name Android hides | idle — never fights your home Wi-Fi |
-| No Wi-Fi, Bluetooth/Wi-Fi off, iPhone not paired, or not configured | blocked, with the reason |
+| No Wi-Fi, Bluetooth/Wi-Fi off, or no enabled entry configured | blocked, with the reason |
+| No Wi-Fi, current iPhone not paired | skip to the next configured iPhone immediately |
 | No Wi-Fi, iPhone link down | `ConnectBluetooth`, backing off 15s…300s |
 | iPhone link connecting | idle; after 45s treat as stuck and retry |
 | iPhone link up | wait 8s for the shortcut, then `ConnectHotspot`, same backoff |
+| New attempt due after N attempts on this iPhone | rotate to the next enabled iPhone, fresh retry budget |
 
 Bluetooth and hotspot retries keep separate budgets, so hotspot attempts backing
 off to five minutes never delay a fresh trigger after the link drops. Both reset

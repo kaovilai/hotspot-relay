@@ -51,9 +51,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kaovilai.hotspotrelay.core.Phase
+import com.kaovilai.hotspotrelay.data.AppSettings
+import com.kaovilai.hotspotrelay.data.IphoneTarget
 import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
@@ -72,16 +75,14 @@ fun SettingsScreen(store: SettingsStore) {
 
     LaunchedEffect(Unit) { bluetooth.start() }
 
-    var iphoneSelector by rememberSaveable { mutableStateOf(saved.iphoneSelector) }
-    var hotspotSsid by rememberSaveable { mutableStateOf(saved.hotspotSsid) }
-    var hotspotPassword by rememberSaveable { mutableStateOf(saved.hotspotPassword) }
+    var rows by remember { mutableStateOf(saved.targets) }
+    var rotateAfter by rememberSaveable { mutableStateOf(saved.rotateAfterAttempts.toString()) }
     var tickSeconds by rememberSaveable { mutableStateOf((saved.tickIntervalMs / 1000).toString()) }
     var autoStartOnBoot by rememberSaveable { mutableStateOf(saved.autoStartOnBoot) }
-    var showPassword by rememberSaveable { mutableStateOf(false) }
+    var revealed by remember { mutableStateOf(setOf<String>()) }
 
-    val dirty = iphoneSelector != saved.iphoneSelector ||
-        hotspotSsid != saved.hotspotSsid ||
-        hotspotPassword != saved.hotspotPassword ||
+    val dirty = rows != saved.targets ||
+        rotateAfter != saved.rotateAfterAttempts.toString() ||
         tickSeconds != (saved.tickIntervalMs / 1000).toString() ||
         autoStartOnBoot != saved.autoStartOnBoot
 
@@ -89,30 +90,37 @@ fun SettingsScreen(store: SettingsStore) {
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { }
 
-    val save: () -> Unit = {
-        val seconds = tickSeconds.toLongOrNull()?.coerceIn(MIN_TICK_SECONDS, MAX_TICK_SECONDS)
+    fun persist(): AppSettings {
+        val seconds = tickSeconds.toLongOrNull()
+            ?.coerceIn(MIN_TICK_SECONDS, MAX_TICK_SECONDS)
             ?: (saved.tickIntervalMs / 1000)
+        val rotate = rotateAfter.toIntOrNull()
+            ?.coerceIn(AppSettings.MIN_ROTATE_AFTER_ATTEMPTS, AppSettings.MAX_ROTATE_AFTER_ATTEMPTS)
+            ?: AppSettings.DEFAULT_ROTATE_AFTER_ATTEMPTS
         val stored = store.update {
             it.copy(
-                iphoneSelector = iphoneSelector.trim(),
-                hotspotSsid = hotspotSsid.trim(),
-                hotspotPassword = hotspotPassword,
+                targets = rows,
+                rotateAfterAttempts = rotate,
                 tickIntervalMs = seconds * 1000,
                 autoStartOnBoot = autoStartOnBoot,
             )
         }
-        // Mirror what was persisted (trimmed) so the form is not left "dirty".
-        iphoneSelector = stored.iphoneSelector
-        hotspotSsid = stored.hotspotSsid
-        hotspotPassword = stored.hotspotPassword
+        rows = stored.targets
+        rotateAfter = stored.rotateAfterAttempts.toString()
         tickSeconds = (stored.tickIntervalMs / 1000).toString()
         autoStartOnBoot = stored.autoStartOnBoot
-        // Keep Android's suggestion in sync with edited credentials; otherwise the
-        // system would keep auto-joining with the old password.
-        if (stored.hotspotSsid.isNotBlank() && stored.hotspotPassword.isNotBlank()) {
-            AndroidWifiLink(context).ensureSuggestion(stored.hotspotSsid, stored.hotspotPassword)
-        }
-        Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show()
+        return stored
+    }
+
+    fun updateTarget(id: String, transform: (IphoneTarget) -> IphoneTarget) {
+        rows = rows.map { if (it.id == id) transform(it) else it }
+    }
+
+    fun moveTarget(id: String, delta: Int) {
+        val index = rows.indexOfFirst { it.id == id }
+        val target = index + delta
+        if (index < 0 || target !in rows.indices) return
+        rows = rows.toMutableList().apply { add(target, removeAt(index)) }
     }
 
     Scaffold(
@@ -129,45 +137,50 @@ fun SettingsScreen(store: SettingsStore) {
             StatusCard(status)
 
             Text(
-                text = "When Android is on no Wi-Fi, it connects Bluetooth to your iPhone. " +
-                    "The iPhone shortcut sees that connection and turns Personal Hotspot on. " +
-                    "Then this app joins the hotspot, retrying until it works.",
+                text = "When Android is on no Wi-Fi, it connects Bluetooth to the first eligible " +
+                    "iPhone. That iPhone's shortcut turns Personal Hotspot on, then this app " +
+                    "joins the hotspot, retrying until it works before moving on to the next iPhone.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            OutlinedTextField(
-                value = iphoneSelector,
-                onValueChange = { iphoneSelector = it },
-                label = { Text("iPhone Bluetooth name or MAC") },
-                singleLine = true,
+            rows.forEachIndexed { index, target ->
+                TargetCard(
+                    index = index,
+                    total = rows.size,
+                    target = target,
+                    revealed = target.id in revealed,
+                    onToggleReveal = {
+                        revealed = if (target.id in revealed) revealed - target.id else revealed + target.id
+                    },
+                    onChange = { transform -> updateTarget(target.id, transform) },
+                    onMoveUp = { moveTarget(target.id, -1) },
+                    onMoveDown = { moveTarget(target.id, +1) },
+                    onDelete = { rows = rows.filterNot { it.id == target.id } },
+                )
+            }
+
+            OutlinedButton(
+                onClick = { rows = rows + IphoneTarget.empty() },
                 modifier = Modifier.fillMaxWidth(),
-            )
+            ) { Text("Add iPhone") }
+
             OutlinedTextField(
-                value = hotspotSsid,
-                onValueChange = { hotspotSsid = it },
-                label = { Text("Hotspot SSID (e.g. iPhone name)") },
+                value = rotateAfter,
+                onValueChange = { rotateAfter = it.filter(Char::isDigit) },
+                label = { Text("Move to the next iPhone after N failed attempts") },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            OutlinedTextField(
-                value = hotspotPassword,
-                onValueChange = { hotspotPassword = it },
-                label = { Text("Hotspot password") },
-                singleLine = true,
-                visualTransformation = if (showPassword) {
-                    androidx.compose.ui.text.input.VisualTransformation.None
-                } else {
-                    PasswordVisualTransformation()
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                supportingText = {
+                    Text(
+                        "${AppSettings.MIN_ROTATE_AFTER_ATTEMPTS}–" +
+                            "${AppSettings.MAX_ROTATE_AFTER_ATTEMPTS}. Set 1 for round-robin; " +
+                            "higher values give the first iPhone a longer turn (priority).",
+                    )
                 },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-                trailingIcon = {
-                    TextButton(onClick = { showPassword = !showPassword }) {
-                        Text(if (showPassword) "Hide" else "Show")
-                    }
-                },
                 modifier = Modifier.fillMaxWidth(),
             )
+
             OutlinedTextField(
                 value = tickSeconds,
                 onValueChange = { tickSeconds = it.filter(Char::isDigit) },
@@ -185,21 +198,13 @@ fun SettingsScreen(store: SettingsStore) {
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = save, enabled = dirty) { Text("Save") }
+                Button(onClick = { persist(); Toast.makeText(context, "Saved", Toast.LENGTH_SHORT).show() }, enabled = dirty) {
+                    Text("Save")
+                }
                 OutlinedButton(
                     onClick = { permissionLauncher.launch(requiredPermissions()) },
                 ) { Text("Grant permissions") }
             }
-
-            FilledTonalButton(
-                onClick = {
-                    val outcome = AndroidWifiLink(context)
-                        .ensureSuggestion(hotspotSsid.trim(), hotspotPassword)
-                    Toast.makeText(context, suggestionMessage(outcome), Toast.LENGTH_LONG).show()
-                },
-                enabled = hotspotSsid.isNotBlank() && hotspotPassword.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Allow hotspot auto-join") }
 
             FilledTonalButton(
                 onClick = {
@@ -232,6 +237,29 @@ fun SettingsScreen(store: SettingsStore) {
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Pair with iPhone (keyboard mode)") }
 
+            FilledTonalButton(
+                onClick = {
+                    val stored = persist()
+                    val wifi = AndroidWifiLink(context)
+                    val complete = stored.targets.filter { it.isComplete }
+                    if (complete.isEmpty()) {
+                        Toast.makeText(
+                            context,
+                            "Add an SSID and password for at least one iPhone first",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@FilledTonalButton
+                    }
+                    complete.forEach { wifi.ensureSuggestion(it.ssid, it.password) }
+                    Toast.makeText(
+                        context,
+                        "Registered ${complete.size} hotspot(s) — approve the system prompt if shown",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Allow hotspot auto-join for all iPhones") }
+
             OutlinedButton(
                 onClick = { openBatterySettings(context) },
                 modifier = Modifier.fillMaxWidth(),
@@ -242,7 +270,7 @@ fun SettingsScreen(store: SettingsStore) {
                     if (status.running) {
                         ReconnectService.stop(context)
                     } else {
-                        save()
+                        persist()
                         ReconnectService.start(context)
                     }
                 },
@@ -251,12 +279,87 @@ fun SettingsScreen(store: SettingsStore) {
 
             Spacer(Modifier.height(8.dp))
             Text(
-                text = "On the iPhone: pair with this phone, then create a Shortcuts " +
-                    "automation whose trigger is Bluetooth → this phone connecting, " +
-                    "running the \"Turn on Personal Hotspot\" shortcut. See the README " +
-                    "for the exact steps and the shortcut file.",
+                text = "On each iPhone: pair with this phone, then create a Shortcuts automation " +
+                    "whose trigger is Bluetooth → this phone connecting, running the \"Set Personal " +
+                    "Hotspot: On\" shortcut. See the README for the exact steps.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun TargetCard(
+    index: Int,
+    total: Int,
+    target: IphoneTarget,
+    revealed: Boolean,
+    onToggleReveal: () -> Unit,
+    onChange: ((IphoneTarget) -> IphoneTarget) -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = target.enabled,
+                    onCheckedChange = { enabled -> onChange { it.copy(enabled = enabled) } },
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "${index + 1}. ${target.displayName}",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Spacer(Modifier.weight(1f))
+                TextButton(onClick = onMoveUp, enabled = index > 0) { Text("↑") }
+                TextButton(onClick = onMoveDown, enabled = index < total - 1) { Text("↓") }
+                TextButton(onClick = onDelete) { Text("Remove") }
+            }
+
+            OutlinedTextField(
+                value = target.label,
+                onValueChange = { value -> onChange { it.copy(label = value) } },
+                label = { Text("Name (optional)") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = target.btSelector,
+                onValueChange = { value -> onChange { it.copy(btSelector = value) } },
+                label = { Text("iPhone Bluetooth name or MAC") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = target.ssid,
+                onValueChange = { value -> onChange { it.copy(ssid = value) } },
+                label = { Text("Hotspot SSID") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = target.password,
+                onValueChange = { value -> onChange { it.copy(password = value) } },
+                label = { Text("Hotspot password") },
+                singleLine = true,
+                visualTransformation = if (revealed) {
+                    VisualTransformation.None
+                } else {
+                    PasswordVisualTransformation()
+                },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                trailingIcon = {
+                    TextButton(onClick = onToggleReveal) {
+                        Text(if (revealed) "Hide" else "Show")
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
             )
         }
     }
@@ -299,12 +402,18 @@ private fun StatusCard(status: ServiceStatus) {
                 text = status.message.ifBlank { "No status yet" },
                 style = MaterialTheme.typography.bodyMedium,
             )
-            if (status.running && status.failures > 0) {
-                Text(
-                    text = "Retries so far: ${status.failures}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            if (status.running) {
+                val details = buildList {
+                    status.targetLabel?.let { add("Target: $it") }
+                    if (status.failures > 0) add("Retries so far: ${status.failures}")
+                }
+                if (details.isNotEmpty()) {
+                    Text(
+                        text = details.joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
     }
@@ -318,14 +427,6 @@ private fun Phase?.label(): String = when (this) {
     Phase.WAITING_FOR_HOTSPOT -> "Waiting for hotspot"
     Phase.CONNECTING_HOTSPOT -> "Joining hotspot"
     Phase.BLOCKED -> "Needs attention"
-}
-
-private fun suggestionMessage(outcome: SuggestionOutcome): String = when (outcome) {
-    SuggestionOutcome.ADDED -> "Hotspot registered — approve the system prompt if shown"
-    SuggestionOutcome.ALREADY_REGISTERED -> "Hotspot already registered"
-    SuggestionOutcome.DUPLICATE -> "Hotspot already registered"
-    SuggestionOutcome.REJECTED -> "System rejected the suggestion (check Wi-Fi permissions)"
-    SuggestionOutcome.ERROR -> "Could not register the hotspot (SSID and password required)"
 }
 
 private fun requiredPermissions(): Array<String> {
