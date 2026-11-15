@@ -151,6 +151,53 @@ off to five minutes never delay a fresh trigger after the link drops. Both reset
 as soon as the link comes up or the hotspot is joined, so a fresh attempt always
 starts at the short delay.
 
+## External control (Tasker, adb, other automation)
+
+The app exposes a small, documented control surface so another automation can
+switch iPhones without opening the UI. Commands are broadcast to
+`.receiver.ControlReceiver`; **explicit** broadcasts are recommended because
+Android does not reliably deliver implicit broadcasts to manifest receivers in
+the background:
+
+```sh
+adb shell am broadcast -n com.kaovilai.hotspotrelay/.receiver.ControlReceiver \
+  -a com.kaovilai.hotspotrelay.action.SET_ENABLED \
+  --es ssid "Work iPhone" --ez enabled false
+```
+
+| Action | Extras | Effect |
+| --- | --- | --- |
+| `…action.SET_ENABLED` | `id` \| `ssid` \| `label` \| `index`, `enabled` (bool) | Enable/disable one iPhone |
+| `…action.MOVE` | selector, `to` (0-based) or `delta` (+1/−1) | Reorder one iPhone; `delta` moves it relative to its position |
+| `…action.SET_ORDER` | `order` = comma-separated SSIDs/labels/ids | Full reorder; unlisted entries are appended |
+| `…action.SET_ROTATE_AFTER` | `value` (1–10) | Rotation limit; `1` = round-robin |
+| `…action.START` / `…action.STOP` | — | Start/stop the loop |
+| `…action.QUERY` | — | No change; returns the current state |
+
+Rules:
+
+- Exactly one selector extra is needed (`id` > `ssid` > `label` > `index`).
+- Every command answers with JSON in the ordered-broadcast result (`state`, `ok`,
+  `message`) and also emits `com.kaovilai.hotspotrelay.action.STATE_CHANGED`
+  with the same extras, so an automation can listen for the new state.
+- State JSON contains `running`, `rotateAfterAttempts`, and per-target
+  `index/id/label/name/selector/ssid/enabled/complete`. **Passwords are never
+  exposed, and commands cannot change credentials, SSIDs or Bluetooth
+  selectors** — that stays in the app UI.
+- `START` may be refused by Android when sent from the background
+  (foreground-service launch restriction); the response message says so.
+- The receiver is exported by necessity (Tasker cannot hold a signature
+  permission), so any app can toggle/reorder/start/stop. None of these actions
+  can read secrets or add networks.
+
+Tasker: *Send Intent* → Target **Broadcast Receiver**, Package
+`com.kaovilai.hotspotrelay`, Class
+`com.kaovilai.hotspotrelay.receiver.ControlReceiver`, Action
+`com.kaovilai.hotspotrelay.action.SET_ENABLED`, Extra `ssid:Work iPhone`,
+Extra `enabled:false:Boolean`. To react to changes, use an *Intent Received*
+event for `com.kaovilai.hotspotrelay.action.STATE_CHANGED` and read
+`%state`.
+
 ## Limitations worth knowing
 
 - **Android cannot switch radios on.** Neither Wi-Fi nor Bluetooth can be enabled

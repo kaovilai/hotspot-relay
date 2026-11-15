@@ -88,6 +88,15 @@ fun SettingsScreen(store: SettingsStore) {
         tickSeconds != (saved.tickIntervalMs / 1000).toString() ||
         autoStartOnBoot != saved.autoStartOnBoot
 
+    // Settings can also change from the external control receiver (Tasker, adb);
+    // reflect those, but never clobber in-progress edits.
+    LaunchedEffect(saved.targets, saved.rotateAfterAttempts, dirty) {
+        if (!dirty) {
+            rows = saved.targets
+            rotateAfter = saved.rotateAfterAttempts.toString()
+        }
+    }
+
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { }

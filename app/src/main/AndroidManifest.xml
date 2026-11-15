@@ -66,6 +66,23 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- External control (Tasker, adb). Commands can toggle/reorder/start/stop
+             but never read or change credentials. Explicit broadcasts are
+             recommended: -n com.kaovilai.hotspotrelay/.receiver.ControlReceiver -->
+        <receiver
+            android:name=".receiver.ControlReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.kaovilai.hotspotrelay.action.QUERY" />
+                <action android:name="com.kaovilai.hotspotrelay.action.START" />
+                <action android:name="com.kaovilai.hotspotrelay.action.STOP" />
+                <action android:name="com.kaovilai.hotspotrelay.action.SET_ENABLED" />
+                <action android:name="com.kaovilai.hotspotrelay.action.MOVE" />
+                <action android:name="com.kaovilai.hotspotrelay.action.SET_ORDER" />
+                <action android:name="com.kaovilai.hotspotrelay.action.SET_ROTATE_AFTER" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>
