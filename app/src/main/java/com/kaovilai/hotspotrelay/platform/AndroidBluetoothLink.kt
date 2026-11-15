@@ -116,6 +116,10 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     /** Keeps the CPU awake for the bounded pairing session (bond wait + drop). */
     private var pairingWakeLock: PowerManager.WakeLock? = null
 
+    /** Invalidates deferred pairing callbacks from an earlier session. */
+    @Volatile
+    private var pairingGeneration = 0
+
     /** Set when enforcement dropped a link on purpose (not an iPhone-side drop). */
     private val policyDrop = java.util.concurrent.atomic.AtomicBoolean(false)
 
@@ -330,6 +334,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         if (!adapter.isEnabled) return PairingModeResult.UNAVAILABLE
 
         pairingMode = true
+        pairingGeneration++
         acquirePairingWakeLock()
         allowedUntilMs = HidConnectionPolicy.allowedUntil(
             SystemClock.elapsedRealtime(),
@@ -338,8 +343,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         watchBondState()
         // Every pairing session expires, including the NOT_READY tap the user
         // never retries; otherwise the bond receiver and pairing state would leak.
-        mainHandler.removeCallbacks(pairingTimeout)
-        mainHandler.postDelayed(pairingTimeout, PAIRING_REGISTRATION_TTL_MS)
+        schedulePairingTimeout()
 
         start()
         val hid = hidDevice ?: return PairingModeResult.NOT_READY
@@ -446,6 +450,14 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         mainHandler.postDelayed(poll, PROBE_POLL_MS)
     }
 
+    private fun isLiveConnected(address: String): Boolean {
+        val hid = hidDevice ?: return false
+        val peer = runCatching { adapter?.getRemoteDevice(address) }.getOrNull() ?: return false
+        return runCatching { hid.getConnectionState(peer) }
+            .getOrDefault(BluetoothProfile.STATE_DISCONNECTED) ==
+            BluetoothProfile.STATE_CONNECTED
+    }
+
     /**
      * Re-checks the allowed window while any HID peer is connected. Every attempt
      * extends the window; once it has passed (plus a short grace) every connected
@@ -461,10 +473,9 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                 val now = SystemClock.elapsedRealtime()
                 if (!HidConnectionPolicy.isAllowed(now, allowedUntilMs)) {
                     val addresses = connectedAddresses.toList()
-                    connectedAddresses.clear()
-                    enforcement = null
-                    releaseEnforcementWakeLock()
                     if (addresses.isEmpty()) {
+                        enforcement = null
+                        releaseEnforcementWakeLock()
                         unregisterHid()
                         return
                     }
@@ -478,6 +489,19 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                         val device = runCatching { adapter?.getRemoteDevice(address) }
                             .getOrNull() ?: return@forEach
                         dropLink(device)
+                    }
+                    // disconnect()/unregisterApp() only report command submission.
+                    // If a peer is still connected, keep it tracked and keep this
+                    // check armed instead of leaving an attached keyboard with no
+                    // enforcement behind it.
+                    val stillConnected = addresses.filter { isLiveConnected(it) }
+                    connectedAddresses.clear()
+                    stillConnected.forEach { connectedAddresses.add(it) }
+                    if (stillConnected.isNotEmpty()) {
+                        mainHandler.postDelayed(this, HidConnectionPolicy.MIN_CHECK_INTERVAL_MS)
+                    } else {
+                        enforcement = null
+                        releaseEnforcementWakeLock()
                     }
                 } else if (connectedAddresses.isEmpty()) {
                     enforcement = null
@@ -524,7 +548,9 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         val lock = runCatching {
             power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HotspotRelay:pairing")
         }.getOrNull() ?: return
-        runCatching { lock.acquire(HidConnectionPolicy.ENFORCEMENT_WAKE_LOCK_MS) }
+        // Session-bounded: released by endPairingMode() (bond, timeout or stop);
+        // a timed lock could expire before a second pairing tap extends the window.
+        runCatching { lock.acquire() }
         pairingWakeLock = lock
     }
 
@@ -552,7 +578,17 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         unregisterHid()
     }
 
-    private val pairingTimeout = Runnable { endPairingMode() }
+    private var pairingTimeout: Runnable? = null
+
+    private fun schedulePairingTimeout() {
+        pairingTimeout?.let(mainHandler::removeCallbacks)
+        val generation = pairingGeneration
+        val timeout = Runnable {
+            if (generation == pairingGeneration) endPairingMode()
+        }
+        pairingTimeout = timeout
+        mainHandler.postDelayed(timeout, PAIRING_REGISTRATION_TTL_MS)
+    }
 
     /**
      * Leaves pairing mode without leaving a keyboard attached. The bond itself is
@@ -560,8 +596,11 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
      */
     private fun endPairingMode(device: BluetoothDevice? = null) {
         pairingMode = false
+        // Any deferred bond/timeout callback from this session is now stale.
+        pairingGeneration++
         allowedUntilMs = 0
-        mainHandler.removeCallbacks(pairingTimeout)
+        pairingTimeout?.let(mainHandler::removeCallbacks)
+        pairingTimeout = null
         cancelEnforcement()
         releasePairingWakeLock()
         stopBondWatch()
@@ -583,8 +622,11 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                 )
                 if (state != BluetoothDevice.BOND_BONDED) return
                 val device = intent.deviceExtra() ?: return
+                // A new pairing session may start during this delay; only the
+                // session that saw the bond may end pairing mode.
+                val generation = pairingGeneration
                 mainHandler.postDelayed(
-                    { endPairingMode(device) },
+                    { if (generation == pairingGeneration) endPairingMode(device) },
                     HidConnectionPolicy.PAIRING_DROP_DELAY_MS,
                 )
             }

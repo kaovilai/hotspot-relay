@@ -422,6 +422,16 @@ fun SettingsScreen(store: SettingsStore) {
                         ).show()
                         return@OutlinedButton
                     }
+                    if (status.running) {
+                        // The loop shares the single HID registration; its own
+                        // trigger/release would tear the probe down mid-check.
+                        Toast.makeText(
+                            context,
+                            "Stop the reconnect loop first — it can interrupt the pairing check",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                        return@OutlinedButton
+                    }
                     pairingCheckRunning = true
                     bluetooth.probePairing(selector) { connected ->
                         pairingCheckRunning = false

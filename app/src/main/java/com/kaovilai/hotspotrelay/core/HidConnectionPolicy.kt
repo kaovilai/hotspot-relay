@@ -30,13 +30,6 @@ object HidConnectionPolicy {
     /** Re-check at least this often while a link is up in an open window. */
     const val MIN_CHECK_INTERVAL_MS = 5_000L
 
-    /**
-     * Bounded wake lock held while a window check is pending. Covers the longest
-     * window (pairing) plus grace, so the drop lands even if the phone sleeps;
-     * it is released as soon as the check finishes.
-     */
-    const val ENFORCEMENT_WAKE_LOCK_MS = 180_000L
-
     fun allowedUntil(nowMs: Long, durationMs: Long): Long = nowMs + durationMs
 
     fun isAllowed(nowMs: Long, allowedUntilMs: Long): Boolean = nowMs <= allowedUntilMs
