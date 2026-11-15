@@ -49,6 +49,19 @@ class ReconnectEngineTest {
     }
 
     @Test
+    fun `policy flag with a still-connected snapshot keeps the backoff`() {
+        val engine = ReconnectEngine()
+
+        // Enforcement can raise the flag while the stack still reports CONNECTED.
+        engine.onTick(
+            snapshot(nowMs = 1_000, iphoneLink = LinkStatus.CONNECTED, linkDroppedByPolicy = true),
+        )
+
+        assertEquals(EngineAction.Idle, engine.onTick(snapshot(nowMs = 1_001)))
+        assertEquals(16_000L, engine.state().nextAttemptAtMs ?: -1L)
+    }
+
+    @Test
     fun `re-arming after a policy drop keeps the accumulated backoff`() {
         val engine = ReconnectEngine()
 

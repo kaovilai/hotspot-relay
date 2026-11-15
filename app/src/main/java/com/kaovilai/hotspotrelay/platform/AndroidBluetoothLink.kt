@@ -208,10 +208,6 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     }
 
     fun snapshot(selector: String): BluetoothSnapshot {
-        // Consumed here, with the link state it describes, so the caller can never
-        // read DISCONNECTED without the matching "we dropped it" flag (or vice
-        // versa).
-        val droppedByPolicy = policyDrop.getAndSet(false)
         if (!hasConnectPermission()) {
             return BluetoothSnapshot(false, false, LinkStatus.DISCONNECTED)
         }
@@ -266,6 +262,12 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         // While a policy drop is still settling, report DISCONNECTED regardless of
         // the live state so the engine never mistakes it for a fresh link.
         val reported = if (pendingForDevice) LinkStatus.DISCONNECTED else link
+        // Read the flag last, together with the state it describes. A drop that
+        // lands between the pending check and here is still reported (the flag is
+        // set after the pending addresses), so a caller can never get DISCONNECTED
+        // without the flag; the reverse (flag with CONNECTED) is safe because the
+        // engine treats a policy drop as link-down.
+        val droppedByPolicy = pendingForDevice || policyDrop.getAndSet(false)
         return BluetoothSnapshot(
             enabled = true,
             bonded = true,
@@ -501,10 +503,10 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                     // Only a drop of the service's own target is reported as a
                     // policy drop; a stray remembered peer must not make the
                     // engine keep the target's backoff.
+                    pendingDisconnectAddresses = denied
                     if (hidTargetAddress in denied) {
                         policyDrop.set(true)
                     }
-                    pendingDisconnectAddresses = denied
                     denied.forEach { address ->
                         val device = runCatching { adapter?.getRemoteDevice(address) }
                             .getOrNull() ?: return@forEach
