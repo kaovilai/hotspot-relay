@@ -225,7 +225,11 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
             }
 
             else -> {
-                if (snapshot.iphoneLink == LinkStatus.DISCONNECTED) linkConnectedAtMs = null
+                if (snapshot.iphoneLink == LinkStatus.DISCONNECTED) {
+                    linkConnectedAtMs = null
+                    // Each uninterrupted CONNECTING episode gets the full timeout.
+                    connectingSinceMs = null
+                }
             }
         }
     }

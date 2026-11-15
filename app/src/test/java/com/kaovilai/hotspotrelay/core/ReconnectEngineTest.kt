@@ -312,6 +312,25 @@ class ReconnectEngineTest {
     }
 
     @Test
+    fun `connecting timeout restarts after a disconnect`() {
+        val engine = ReconnectEngine(RetryPolicy(hotspotGraceMs = 0, connectingTimeoutMs = 45_000))
+
+        engine.onTick(snapshot(nowMs = 0, iphoneLink = LinkStatus.CONNECTING))
+        engine.onTick(snapshot(nowMs = 10_000, iphoneLink = LinkStatus.DISCONNECTED))
+        engine.onTick(snapshot(nowMs = 30_000, iphoneLink = LinkStatus.CONNECTING))
+
+        // The second CONNECTING episode started at 30s, so it has until 75s.
+        assertEquals(
+            EngineAction.Idle,
+            engine.onTick(snapshot(nowMs = 74_999, iphoneLink = LinkStatus.CONNECTING)),
+        )
+        assertEquals(
+            EngineAction.ConnectBluetooth,
+            engine.onTick(snapshot(nowMs = 75_000, iphoneLink = LinkStatus.CONNECTING)),
+        )
+    }
+
+    @Test
     fun `hotspot backoff does not delay a new bluetooth trigger`() {
         val engine = ReconnectEngine(RetryPolicy(hotspotGraceMs = 0))
 

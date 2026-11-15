@@ -47,8 +47,12 @@ class AndroidWifiLink(private val context: Context) {
         appContext.getSystemService(ConnectivityManager::class.java)
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /** Currently associated Wi-Fi networks and their SSIDs (null when hidden). */
-    private val trackedWifi = ConcurrentHashMap<Network, String?>()
+    /** Currently associated Wi-Fi networks. */
+    private val trackedWifi: MutableSet<Network> = ConcurrentHashMap.newKeySet()
+
+    /** Request callbacks that are still live, so stop() can cancel them. */
+    private val activeRequests: MutableSet<ConnectivityManager.NetworkCallback> =
+        ConcurrentHashMap.newKeySet()
 
     @Volatile
     private var trackingRegistered = false
@@ -65,7 +69,7 @@ class AndroidWifiLink(private val context: Context) {
 
     private val wifiCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-            trackedWifi[network] = ssidOf(capabilities)
+            trackedWifi.add(network)
         }
 
         override fun onLost(network: Network) {
@@ -76,6 +80,8 @@ class AndroidWifiLink(private val context: Context) {
     fun start() {
         if (trackingRegistered) return
         val manager = connectivity ?: return
+        // The flags overload that would include location info in capabilities is a
+        // system API; instead the SSID comes from WifiManager.connectionInfo below.
         trackingRegistered = runCatching {
             manager.registerNetworkCallback(wifiRequest, wifiCallback)
         }.onFailure { Log.w(TAG, "cannot track Wi-Fi networks", it) }
@@ -83,10 +89,20 @@ class AndroidWifiLink(private val context: Context) {
     }
 
     fun stop() {
-        if (!trackingRegistered) return
-        trackingRegistered = false
-        runCatching { connectivity?.unregisterNetworkCallback(wifiCallback) }
+        if (trackingRegistered) {
+            trackingRegistered = false
+            runCatching { connectivity?.unregisterNetworkCallback(wifiCallback) }
+        }
         trackedWifi.clear()
+        // Cancel any hotspot request still in flight; a stopped service must not
+        // keep a connection (or its system prompt) alive.
+        val manager = connectivity
+        activeRequests.toList().forEach { callback ->
+            activeRequests.remove(callback)
+            runCatching { manager?.unregisterNetworkCallback(callback) }
+        }
+        satisfiedNetwork = null
+        hotspotRequestSatisfiedAtMs = 0L
     }
 
     @Suppress("DEPRECATION")
@@ -95,8 +111,7 @@ class AndroidWifiLink(private val context: Context) {
     fun association(): WifiAssociation {
         if (trackingRegistered) {
             if (trackedWifi.isEmpty()) return WifiAssociation(false, null)
-            val ssid = trackedWifi.values.firstOrNull { it != null }
-            return WifiAssociation(true, ssid)
+            return WifiAssociation(true, currentSsid())
         }
         // Tracking registration failed; fall back to the default route.
         val manager = connectivity ?: return WifiAssociation(false, null)
@@ -107,6 +122,18 @@ class AndroidWifiLink(private val context: Context) {
         }
         return WifiAssociation(true, ssidOf(capabilities))
     }
+
+    /**
+     * SSID of the current connection. `getConnectionInfo` is deprecated but still
+     * the only public call that returns an unredacted SSID once location has been
+     * granted; capabilities delivered without the system-only location flag do not.
+     */
+    @Suppress("DEPRECATION")
+    private fun currentSsid(): String? = runCatching {
+        val info = wifi?.connectionInfo ?: return@runCatching null
+        val ssid = info.ssid?.removeSurrounding("\"")
+        ssid?.takeIf { it.isNotBlank() && it != UNKNOWN_SSID }
+    }.getOrNull()
 
     /**
      * True when our own targeted request to the hotspot recently came up. This
@@ -206,6 +233,8 @@ class AndroidWifiLink(private val context: Context) {
 
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                // Late delivery after stop() must not resurrect the association.
+                if (!activeRequests.contains(this)) return
                 hotspotRequestSatisfiedAtMs = SystemClock.elapsedRealtime()
                 satisfiedNetwork = network
                 Log.i(TAG, "hotspot request satisfied")
@@ -231,14 +260,21 @@ class AndroidWifiLink(private val context: Context) {
 
         release = {
             if (released.compareAndSet(false, true)) {
+                mainHandler.removeCallbacks(releaseRunnable)
+                activeRequests.remove(callback)
                 runCatching { manager.unregisterNetworkCallback(callback) }
             }
         }
 
+        // Register before the call so an immediate callback is not treated as late.
+        activeRequests.add(callback)
         val accepted = runCatching { manager.requestNetwork(request, callback) }
             .onFailure { Log.w(TAG, "requestNetwork failed", it) }
             .isSuccess
-        if (!accepted) return
+        if (!accepted) {
+            activeRequests.remove(callback)
+            return
+        }
 
         // The no-timeout overload exists on all supported API levels; enforce the
         // timeout ourselves. onAvailable reschedules this to the shorter hold.
