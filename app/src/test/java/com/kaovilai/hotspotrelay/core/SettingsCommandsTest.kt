@@ -175,6 +175,14 @@ class SettingsCommandsTest {
     }
 
     @Test
+    fun `explicit id and ssid selectors never fall back to a display name`() {
+        assertNull(SettingsCommands.resolveIndex(settings.targets, TargetSelector.BySsid("Work")))
+        assertNull(SettingsCommands.resolveIndex(settings.targets, TargetSelector.ById("Work")))
+        // The label selector keeps its display-name fallback for blank labels.
+        assertEquals(2, SettingsCommands.resolveIndex(settings.targets, TargetSelector.ByLabel("Spare iPhone")))
+    }
+
+    @Test
     fun `resolve index gives the position of a selector`() {
         assertEquals(1, SettingsCommands.resolveIndex(settings.targets, TargetSelector.BySsid("Work iPhone")))
         assertNull(SettingsCommands.resolveIndex(settings.targets, TargetSelector.BySsid("Nope")))

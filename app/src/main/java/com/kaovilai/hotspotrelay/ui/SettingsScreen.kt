@@ -4,8 +4,14 @@ import android.Manifest
 import android.bluetooth.BluetoothAdapter
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -19,17 +25,22 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -39,6 +50,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -54,6 +66,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kaovilai.hotspotrelay.core.Phase
 import com.kaovilai.hotspotrelay.data.AppSettings
@@ -63,9 +76,12 @@ import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.data.TargetsCodec
 import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
+import com.kaovilai.hotspotrelay.platform.BluetoothDiscovery
 import com.kaovilai.hotspotrelay.platform.PairingModeResult
+import com.kaovilai.hotspotrelay.platform.PickableDevice
 import com.kaovilai.hotspotrelay.platform.SuggestionOutcome
 import com.kaovilai.hotspotrelay.platform.SuggestionSync
+import com.kaovilai.hotspotrelay.platform.WifiAssociation
 import com.kaovilai.hotspotrelay.service.ReconnectService
 import com.kaovilai.hotspotrelay.service.ServiceStatus
 
@@ -76,8 +92,68 @@ fun SettingsScreen(store: SettingsStore) {
     val status by ReconnectService.status.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val bluetooth = remember { AndroidBluetoothLink.get(context) }
+    val wifiLink = remember { AndroidWifiLink(context) }
+    val discovery = remember { BluetoothDiscovery(context) }
+
+    // association() reports associated=true with a null SSID when Android hides
+    // the name (no Location permission); keep both so the helper can say why.
+    var wifiAssociation by remember { mutableStateOf(WifiAssociation(associated = false, ssid = null)) }
+    var pickerTargetId by remember { mutableStateOf<String?>(null) }
+    var pickerDevices by remember { mutableStateOf(emptyList<PickableDevice>()) }
+    var pickerScanning by remember { mutableStateOf(false) }
+    var pickerIsScan by remember { mutableStateOf(false) }
+    var pickerNotice by remember { mutableStateOf<String?>(null) }
+    val scanPermissionName = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        "Nearby devices"
+    } else {
+        "Location"
+    }
 
     LaunchedEffect(Unit) { bluetooth.start() }
+
+    // Read the current SSID for "Use current Wi-Fi" and keep it fresh: it changes
+    // when a network comes or goes, and granting location un-redacts it.
+    DisposableEffect(Unit) {
+        wifiLink.start()
+        val manager = context.getSystemService(ConnectivityManager::class.java)
+        val main = Handler(Looper.getMainLooper())
+        val refresh = {
+            main.post { wifiAssociation = wifiLink.association() }
+        }
+        // Wi-Fi transport, not the default network: a hotspot without validated
+        // Internet never becomes the default route while cellular is up, but
+        // joining or leaving it must still refresh the SSID.
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                refresh()
+            }
+
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                refresh()
+            }
+
+            override fun onLost(network: Network) {
+                refresh()
+            }
+        }
+        val registered = runCatching { manager?.registerNetworkCallback(request, callback) }.isSuccess
+        wifiAssociation = wifiLink.association()
+        onDispose {
+            if (registered) runCatching { manager?.unregisterNetworkCallback(callback) }
+            main.removeCallbacksAndMessages(null)
+            wifiLink.stop()
+            discovery.stop()
+        }
+    }
+
+    // Returning to the screen (or a grant in another app) can change the SSID too.
+    LifecycleResumeEffect(Unit) {
+        wifiAssociation = wifiLink.association()
+        onPauseOrDispose { }
+    }
 
     var rows by rememberSaveable(stateSaver = TargetsSaver) { mutableStateOf(saved.targets) }
     var rotateAfter by rememberSaveable { mutableStateOf(saved.rotateAfterAttempts.toString()) }
@@ -117,7 +193,10 @@ fun SettingsScreen(store: SettingsStore) {
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) { }
+    ) {
+        // Granting location removes Android's SSID redaction; read it right away.
+        wifiAssociation = wifiLink.association()
+    }
 
     fun persist(): AppSettings {
         val seconds = tickSeconds.toLongOrNull()
@@ -159,6 +238,53 @@ fun SettingsScreen(store: SettingsStore) {
         rows = rows.toMutableList().apply { add(target, removeAt(index)) }
     }
 
+    fun startPickerScan() {
+        pickerScanning = true
+        pickerNotice = null
+        var found = 0
+        discovery.start(
+            onFound = { device ->
+                found++
+                // Replace an existing entry for the same MAC so a later scan can
+                // fill in a name that was still unknown on the first sighting
+                // (Bluetooth often resolves names only after that).
+                pickerDevices = (pickerDevices.filterNot { it.address == device.address } + device)
+                    .sortedBy { it.label.lowercase() }
+            },
+            onFinished = {
+                pickerScanning = false
+                if (found == 0) {
+                    pickerNotice = "No new devices found. Keep the iPhone on Settings → Bluetooth and try again."
+                }
+            },
+            onUnavailable = {
+                pickerScanning = false
+                pickerNotice = "Couldn't start scanning — grant $scanPermissionName permission and turn Bluetooth on."
+            },
+        )
+    }
+
+    fun openPicker(id: String, scan: Boolean) {
+        pickerTargetId = id
+        pickerIsScan = scan
+        pickerNotice = null
+        pickerDevices = if (scan) emptyList() else bluetooth.pairedDevices()
+        if (scan) startPickerScan()
+    }
+
+    fun chooseDevice(device: PickableDevice) {
+        val id = pickerTargetId ?: return
+        updateTarget(id) {
+            it.copy(
+                btSelector = device.address,
+                label = it.label.ifBlank { device.name.orEmpty() },
+            )
+        }
+        discovery.stop()
+        pickerTargetId = null
+        pickerScanning = false
+    }
+
     Scaffold(
         topBar = { TopAppBar(title = { Text("Hotspot Relay") }) },
     ) { padding ->
@@ -185,6 +311,8 @@ fun SettingsScreen(store: SettingsStore) {
                     index = index,
                     total = rows.size,
                     target = target,
+                    currentSsid = wifiAssociation.ssid,
+                    wifiAssociated = wifiAssociation.associated,
                     revealed = target.id in revealed,
                     onToggleReveal = {
                         revealed = if (target.id in revealed) revealed - target.id else revealed + target.id
@@ -193,6 +321,13 @@ fun SettingsScreen(store: SettingsStore) {
                     onMoveUp = { moveTarget(target.id, -1) },
                     onMoveDown = { moveTarget(target.id, +1) },
                     onDelete = { rows = rows.filterNot { it.id == target.id } },
+                    onPickDevice = { openPicker(target.id, scan = false) },
+                    onScanNearby = { openPicker(target.id, scan = true) },
+                    onUseCurrentSsid = {
+                        wifiAssociation.ssid?.let { ssid ->
+                            updateTarget(target.id) { it.copy(ssid = ssid) }
+                        }
+                    },
                 )
             }
 
@@ -337,6 +472,48 @@ fun SettingsScreen(store: SettingsStore) {
             )
         }
     }
+
+    pickerTargetId?.let { targetId ->
+        val target = rows.firstOrNull { it.id == targetId }
+        DevicePickerDialog(
+            title = if (pickerIsScan) {
+                "Nearby devices${target?.let { " for ${it.displayName}" } ?: ""}"
+            } else {
+                "Paired devices${target?.let { " for ${it.displayName}" } ?: ""}"
+            },
+            devices = pickerDevices,
+            scanning = pickerScanning,
+            notice = pickerNotice,
+            emptyHint = when {
+                pickerIsScan ->
+                    "No devices yet. Grant $scanPermissionName permission, make the iPhone discoverable, and keep this dialog open."
+
+                // pairedDevices() returns empty without the permission, so do not
+                // tell the user to pair an iPhone that is already bonded.
+                !bluetooth.canReadPairedDevices() ->
+                    "Bluetooth permission is missing, so paired devices can't be listed. Tap Grant permissions on the main screen, then reopen this picker."
+
+                else -> "No paired devices. Pair the iPhone first (Pair with iPhone, keyboard mode)."
+            },
+            onSelect = ::chooseDevice,
+            onScan = if (pickerScanning) {
+                null
+            } else {
+                {
+                    // Keep the paired list; nearby results are merged into it by
+                    // startPickerScan, so a bonded iPhone that is not discoverable
+                    // stays selectable.
+                    pickerIsScan = true
+                    startPickerScan()
+                }
+            },
+            onDismiss = {
+                discovery.stop()
+                pickerScanning = false
+                pickerTargetId = null
+            },
+        )
+    }
 }
 
 @Composable
@@ -344,12 +521,17 @@ private fun TargetCard(
     index: Int,
     total: Int,
     target: IphoneTarget,
+    currentSsid: String?,
+    wifiAssociated: Boolean,
     revealed: Boolean,
     onToggleReveal: () -> Unit,
     onChange: ((IphoneTarget) -> IphoneTarget) -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
     onDelete: () -> Unit,
+    onPickDevice: () -> Unit,
+    onScanNearby: () -> Unit,
+    onUseCurrentSsid: () -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -386,6 +568,10 @@ private fun TargetCard(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onPickDevice) { Text("Pick paired") }
+                OutlinedButton(onClick = onScanNearby) { Text("Scan nearby") }
+            }
             OutlinedTextField(
                 value = target.ssid,
                 onValueChange = { value -> onChange { it.copy(ssid = value) } },
@@ -393,6 +579,17 @@ private fun TargetCard(
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )
+            TextButton(onClick = onUseCurrentSsid, enabled = currentSsid != null) {
+                Text(
+                    currentSsid?.let { "Use current Wi-Fi: $it" }
+                        ?: if (wifiAssociated) {
+                            // Android redacts the name without Location permission.
+                            "Use current Wi-Fi (name hidden — grant Location)"
+                        } else {
+                            "Use current Wi-Fi (not connected)"
+                        },
+                )
+            }
             OutlinedTextField(
                 value = target.password,
                 onValueChange = { value -> onChange { it.copy(password = value) } },
@@ -413,6 +610,58 @@ private fun TargetCard(
             )
         }
     }
+}
+
+@Composable
+private fun DevicePickerDialog(
+    title: String,
+    devices: List<PickableDevice>,
+    scanning: Boolean,
+    notice: String?,
+    emptyHint: String,
+    onSelect: (PickableDevice) -> Unit,
+    onScan: (() -> Unit)?,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                if (scanning) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                // Shown next to the list as well: a failed or empty scan used to be
+                // silent whenever paired devices were already listed.
+                notice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+                if (devices.isEmpty()) {
+                    Text(emptyHint, style = MaterialTheme.typography.bodySmall)
+                } else {
+                    LazyColumn(modifier = Modifier.heightIn(max = 360.dp)) {
+                        items(devices, key = { it.address }) { device ->
+                            TextButton(
+                                onClick = { onSelect(device) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Text(device.label, style = MaterialTheme.typography.bodyLarge)
+                                    Text(
+                                        device.address,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        },
+        dismissButton = onScan?.let { scan -> { TextButton(onClick = scan) { Text("Scan nearby") } } },
+    )
 }
 
 @Composable
@@ -488,6 +737,7 @@ private fun requiredPermissions(): Array<String> {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         permissions += Manifest.permission.BLUETOOTH_CONNECT
         permissions += Manifest.permission.BLUETOOTH_ADVERTISE
+        permissions += Manifest.permission.BLUETOOTH_SCAN
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         permissions += Manifest.permission.POST_NOTIFICATIONS

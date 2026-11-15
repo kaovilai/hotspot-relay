@@ -220,7 +220,13 @@ class ControlReceiver : BroadcastReceiver() {
         if (!intent.hasExtra("enabled")) return null
         return when (val raw = intent.extras?.get("enabled")) {
             is Boolean -> raw
-            is Number -> raw.toInt() != 0
+            // Only 0 and 1 are accepted numeric aliases. Anything else (2, 0.5)
+            // is a caller bug and must not be truncated into a boolean.
+            is Number -> when (raw.toDouble()) {
+                1.0 -> true
+                0.0 -> false
+                else -> null
+            }
             is String -> when (raw.trim().lowercase()) {
                 "true", "1", "yes", "on" -> true
                 "false", "0", "no", "off" -> false

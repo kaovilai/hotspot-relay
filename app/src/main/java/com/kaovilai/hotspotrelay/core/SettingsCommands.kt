@@ -171,18 +171,12 @@ object SettingsCommands {
         when (selector) {
             is TargetSelector.ById -> targets.firstOrNull { it.id == selector.id }
             is TargetSelector.BySsid -> targets.firstOrNull { it.ssid == selector.ssid }
+            // A blank label is common; fall back to whatever the user sees. Only
+            // the label selector has that fallback: an explicit id or ssid must
+            // never silently act on a target whose displayed name happens to
+            // match, e.g. SET_ENABLED ssid="Work iPhone" when that is a label.
             is TargetSelector.ByLabel -> targets.firstOrNull { it.label == selector.label }
+                ?: targets.firstOrNull { it.displayName == selector.label }
             is TargetSelector.ByIndex -> targets.getOrNull(selector.index)
-        }.let { resolved ->
-            // A blank label is common; fall back to whatever the user sees.
-            resolved ?: when (selector) {
-                is TargetSelector.ByLabel ->
-                    targets.firstOrNull { it.displayName == selector.label }
-                is TargetSelector.BySsid ->
-                    targets.firstOrNull { it.displayName == selector.ssid }
-                is TargetSelector.ById ->
-                    targets.firstOrNull { it.displayName == selector.id }
-                is TargetSelector.ByIndex -> null
-            }
         }
 }
