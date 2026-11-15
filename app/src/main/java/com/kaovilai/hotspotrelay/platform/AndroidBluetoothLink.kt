@@ -20,6 +20,7 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.kaovilai.hotspotrelay.core.HidConnectionPolicy
 import com.kaovilai.hotspotrelay.core.LinkStatus
+import com.kaovilai.hotspotrelay.core.PolicyDropLedger
 
 data class BluetoothSnapshot(
     val enabled: Boolean,
@@ -128,8 +129,12 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     @Volatile
     private var pairingGeneration = 0
 
-    /** Set when enforcement dropped a link on purpose (not an iPhone-side drop). */
-    private val policyDrop = java.util.concurrent.atomic.AtomicBoolean(false)
+    /**
+     * Set when enforcement dropped a link on purpose (not an iPhone-side drop).
+     * [PolicyDropLedger] delivers each drop once, whatever order the snapshot
+     * and the enforcement batch interleave in.
+     */
+    private val policyDrops = PolicyDropLedger()
 
     /**
      * Addresses enforcement asked to disconnect. Until the stack reports them
@@ -204,7 +209,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         allowedUntilMs = 0
         connectedAddresses.clear()
         pendingDisconnectAddresses = emptyList()
-        policyDrop.set(false)
+        policyDrops.clear()
         unregisterHid()
         val hid = hidDevice
         if (hid != null) {
@@ -270,17 +275,16 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         // While a policy drop is still settling, report DISCONNECTED regardless of
         // the live state so the engine never mistakes it for a fresh link.
         val reported = if (pendingForDevice) LinkStatus.DISCONNECTED else link
-        // Read the flag last, together with the state it describes. A drop that
-        // lands between the pending check and here is still reported (the flag is
-        // set after the pending addresses), so a caller can never get DISCONNECTED
-        // without the flag; the reverse (flag with CONNECTED) is safe because the
-        // engine treats a policy drop as link-down.
-        val droppedByPolicy = pendingForDevice || policyDrop.getAndSet(false)
+        // Consume unconditionally (no short-circuit): the ledger records before the
+        // pending set is published, so a snapshot that sees a pending teardown also
+        // sees its drop, and a drop a snapshot beat is delivered on the next one —
+        // exactly once either way.
+        val justDropped = policyDrops.consume()
         return BluetoothSnapshot(
             enabled = true,
             bonded = true,
             link = reported,
-            droppedByPolicy = droppedByPolicy,
+            droppedByPolicy = pendingForDevice || justDropped,
         )
     }
 
@@ -508,13 +512,16 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                     }
                     val denied = addresses.filterNot { isPeerAllowed(it, now) }
                     if (denied.isNotEmpty()) {
+                        // Record before publishing the pending set: a snapshot that
+                        // sees the pending teardown must also see its policy drop,
+                        // and a snapshot that comes earlier gets it on the next tick.
                         // Only a drop of the service's own target is reported as a
                         // policy drop; a stray remembered peer must not make the
                         // engine keep the target's backoff.
-                        pendingDisconnectAddresses = denied
                         if (hidTargetAddress in denied) {
-                            policyDrop.set(true)
+                            policyDrops.record()
                         }
+                        pendingDisconnectAddresses = denied
                         denied.forEach { address ->
                             val device = runCatching { adapter?.getRemoteDevice(address) }
                                 .getOrNull() ?: return@forEach
