@@ -234,12 +234,30 @@ class AndroidWifiLink(private val context: Context) {
 
     /**
      * Revokes the auto-join suggestion for an SSID that is no longer configured.
-     * Only possible where suggestions can be enumerated (API 30+); on API 29 the
-     * platform offers no way to look them up, so this is a no-op there.
+     *
+     * API 30+ enumerates the app's suggestions and removes by SSID. API 29 cannot
+     * enumerate at all, so the caller passes the old credentials and the matching
+     * [WifiNetworkSuggestion] is removed instead; without them removal is not
+     * possible and this is a no-op.
      */
-    fun forgetSuggestion(ssid: String) {
+    fun forgetSuggestion(ssid: String, passphrase: String? = null) {
         if (ssid.isBlank()) return
-        removeSuggestions(ssid)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            removeSuggestions(ssid)
+        } else if (!passphrase.isNullOrEmpty()) {
+            removeMatchingSuggestion(ssid, passphrase)
+        }
+    }
+
+    private fun removeMatchingSuggestion(ssid: String, passphrase: String) {
+        val suggestion = runCatching {
+            WifiNetworkSuggestion.Builder()
+                .setSsid(ssid)
+                .setWpa2Passphrase(passphrase)
+                .build()
+        }.getOrNull() ?: return
+        runCatching { wifi?.removeNetworkSuggestions(listOf(suggestion)) }
+            .onFailure { Log.w(TAG, "removeNetworkSuggestions failed", it) }
     }
 
     private fun removeSuggestions(ssid: String) {

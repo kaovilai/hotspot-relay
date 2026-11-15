@@ -25,9 +25,11 @@ import com.kaovilai.hotspotrelay.core.TargetRotation
 import com.kaovilai.hotspotrelay.core.WorldSnapshot
 import com.kaovilai.hotspotrelay.data.AppSettings
 import com.kaovilai.hotspotrelay.data.IphoneTarget
+import com.kaovilai.hotspotrelay.data.SettingsStateJson
 import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
+import com.kaovilai.hotspotrelay.receiver.ControlReceiver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -62,6 +64,19 @@ class ReconnectService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var loop: Job? = null
+
+    /**
+     * Set before the shutdown status is published. A tick already running on
+     * [Dispatchers.Default] can reach `finishTick()` after `onDestroy()`; without
+     * this guard it would publish `running = true` again (and broadcast a
+     * spurious "service started"), leaving queries reporting a stopped service
+     * as running.
+     */
+    @Volatile
+    private var destroyed = false
+
+    /** Serializes [publish] with the destroyed flag so shutdown stays terminal. */
+    private val statusLock = Any()
 
     private lateinit var settingsStore: SettingsStore
     private lateinit var bluetooth: AndroidBluetoothLink
@@ -107,6 +122,7 @@ class ReconnectService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        synchronized(statusLock) { destroyed = true }
         loop?.cancel()
         scope.cancel()
         wifi.stop()
@@ -372,7 +388,34 @@ class ReconnectService : Service() {
     }
 
     private fun publish(status: ServiceStatus) {
-        _status.value = status
+        synchronized(statusLock) {
+            // A tick that outlived shutdown must not resurrect `running = true`;
+            // the stop status published from onDestroy() is terminal. The lock
+            // makes the check-and-write atomic against onDestroy().
+            if (destroyed && status.running) return
+            val wasRunning = _status.value.running
+            _status.value = status
+            if (wasRunning != status.running) broadcastRunningState(status.running)
+        }
+    }
+
+    /**
+     * External automation (Tasker, adb) listens for STATE_CHANGED. Emit it when
+     * the loop actually starts or stops — including a foreground start that is
+     * refused right after the command returned — so a START/STOP command never
+     * leaves listeners on the pre-transition `running` value. Routine ticks do
+     * not broadcast.
+     */
+    private fun broadcastRunningState(running: Boolean) {
+        runCatching {
+            val state = SettingsStateJson.encode(SettingsStore.get(this).settings.value, running)
+            sendBroadcast(
+                Intent(ControlReceiver.ACTION_STATE_CHANGED)
+                    .putExtra("ok", true)
+                    .putExtra("message", if (running) "service started" else "service stopped")
+                    .putExtra("state", state),
+            )
+        }.onFailure { Log.w(TAG, "cannot broadcast running state", it) }
     }
 
     companion object {

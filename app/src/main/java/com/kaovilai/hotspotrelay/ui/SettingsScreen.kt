@@ -57,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.kaovilai.hotspotrelay.core.Phase
 import com.kaovilai.hotspotrelay.data.AppSettings
+import org.json.JSONObject
 import com.kaovilai.hotspotrelay.data.IphoneTarget
 import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.data.TargetsCodec
@@ -64,6 +65,7 @@ import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
 import com.kaovilai.hotspotrelay.platform.PairingModeResult
 import com.kaovilai.hotspotrelay.platform.SuggestionOutcome
+import com.kaovilai.hotspotrelay.platform.SuggestionSync
 import com.kaovilai.hotspotrelay.service.ReconnectService
 import com.kaovilai.hotspotrelay.service.ServiceStatus
 
@@ -82,11 +84,36 @@ fun SettingsScreen(store: SettingsStore) {
     var tickSeconds by rememberSaveable { mutableStateOf((saved.tickIntervalMs / 1000).toString()) }
     var autoStartOnBoot by rememberSaveable { mutableStateOf(saved.autoStartOnBoot) }
     var revealed by remember { mutableStateOf(setOf<String>()) }
+    // The persisted values the form was last synced with. Comparing against this
+    // rather than against `saved` means an external change (Tasker, adb) does not
+    // look like a local edit: it can be adopted while the form is untouched, and
+    // Save cannot silently revert it. It is saved across activity recreation as
+    // well, otherwise a draft that outlives the rotation loses the baseline it
+    // was edited against.
+    var synced by rememberSaveable(stateSaver = SyncedSaver) { mutableStateOf(saved) }
 
-    val dirty = rows != saved.targets ||
-        rotateAfter != saved.rotateAfterAttempts.toString() ||
-        tickSeconds != (saved.tickIntervalMs / 1000).toString() ||
-        autoStartOnBoot != saved.autoStartOnBoot
+    val dirty = rows != synced.targets ||
+        rotateAfter != synced.rotateAfterAttempts.toString() ||
+        tickSeconds != (synced.tickIntervalMs / 1000).toString() ||
+        autoStartOnBoot != synced.autoStartOnBoot
+
+    // Settings can also change from the external control receiver (Tasker, adb);
+    // reflect those, but never clobber in-progress edits. `dirty` is a key so an
+    // external change that arrived while the form was edited is still adopted
+    // once the edits are reverted (saved does not change again in that case).
+    LaunchedEffect(saved, dirty) {
+        val untouched = rows == synced.targets &&
+            rotateAfter == synced.rotateAfterAttempts.toString() &&
+            tickSeconds == (synced.tickIntervalMs / 1000).toString() &&
+            autoStartOnBoot == synced.autoStartOnBoot
+        if (untouched) {
+            synced = saved
+            rows = saved.targets
+            rotateAfter = saved.rotateAfterAttempts.toString()
+            tickSeconds = (saved.tickIntervalMs / 1000).toString()
+            autoStartOnBoot = saved.autoStartOnBoot
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
@@ -107,24 +134,17 @@ fun SettingsScreen(store: SettingsStore) {
                 autoStartOnBoot = autoStartOnBoot,
             )
         }
-        // Reconcile suggestions: a deleted or cleared entry's SSID would
-        // otherwise stay auto-joined forever. Removal is API 30+ (enumeration
-        // is unavailable before that) and silent if there is nothing to remove.
-        val keepSsids = stored.targets.filter { it.enabled && it.isComplete }
-            .map { it.ssid }.toSet()
-        val stale = saved.targets.map { it.ssid }
-            .filter { it.isNotBlank() && it !in keepSsids }.toSet()
-        stale.forEach { ssid -> runCatching { AndroidWifiLink(context).forgetSuggestion(ssid) } }
+        // Keep Android's suggestions in sync: a deleted, cleared or disabled
+        // entry must stop being auto-joined, and edited credentials must be
+        // re-registered or the system keeps using the old password. Retry any
+        // registration that failed earlier, even when nothing changed now.
+        SuggestionSync.reconcile(context, saved, stored, retryMissing = true)
 
+        synced = stored
         rows = stored.targets
         rotateAfter = stored.rotateAfterAttempts.toString()
         tickSeconds = (stored.tickIntervalMs / 1000).toString()
         autoStartOnBoot = stored.autoStartOnBoot
-        // Keep Android's suggestions in sync with edited credentials; otherwise the
-        // system would keep auto-joining with the old password.
-        val wifi = AndroidWifiLink(context)
-        stored.targets.filter { it.enabled && it.isComplete }
-            .forEach { wifi.ensureSuggestion(it.ssid, it.password) }
         return stored
     }
 
@@ -257,7 +277,9 @@ fun SettingsScreen(store: SettingsStore) {
                 onClick = {
                     val stored = persist()
                     val wifi = AndroidWifiLink(context)
-                    val complete = stored.targets.filter { it.isComplete }
+                    // Enabled only: a disabled entry must not win the per-SSID
+                    // deduplication and overwrite an enabled target's password.
+                    val complete = stored.targets.filter { it.enabled && it.isComplete }
                     if (complete.isEmpty()) {
                         Toast.makeText(
                             context,
@@ -266,7 +288,10 @@ fun SettingsScreen(store: SettingsStore) {
                         ).show()
                         return@FilledTonalButton
                     }
-                    val results = complete.map { it to wifi.ensureSuggestion(it.ssid, it.password) }
+                    // One suggestion per SSID: keep the highest-priority target,
+                    // matching what the reconnect loop and SuggestionSync use.
+                    val unique = complete.distinctBy { it.ssid }
+                    val results = unique.map { it to wifi.ensureSuggestion(it.ssid, it.password) }
                     val failed = results
                         .filter { (_, outcome) ->
                             outcome == SuggestionOutcome.ERROR || outcome == SuggestionOutcome.REJECTED
@@ -491,4 +516,34 @@ private const val MAX_TICK_SECONDS = 300L
 private val TargetsSaver = Saver<List<IphoneTarget>, String>(
     save = { TargetsCodec.encode(it) },
     restore = { TargetsCodec.decode(it) },
+)
+
+/**
+ * Saves the form's synced baseline across activity recreation. Without it a
+ * draft restored by [rememberSaveable] would be compared against the latest
+ * persisted settings instead of the values it was edited from, making a
+ * reverted edit look dirty and letting Start/Save overwrite an external change.
+ */
+private val SyncedSaver = Saver<AppSettings, String>(
+    save = { settings ->
+        JSONObject().apply {
+            put("targets", TargetsCodec.encode(settings.targets))
+            put("rotate", settings.rotateAfterAttempts)
+            put("tick", settings.tickIntervalMs)
+            put("boot", settings.autoStartOnBoot)
+            put("service", settings.serviceEnabled)
+        }.toString()
+    },
+    restore = { raw ->
+        runCatching {
+            val json = JSONObject(raw)
+            AppSettings(
+                targets = TargetsCodec.decode(json.getString("targets")),
+                rotateAfterAttempts = json.getInt("rotate"),
+                tickIntervalMs = json.getLong("tick"),
+                autoStartOnBoot = json.getBoolean("boot"),
+                serviceEnabled = json.getBoolean("service"),
+            )
+        }.getOrNull()
+    },
 )

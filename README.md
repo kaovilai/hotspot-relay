@@ -133,7 +133,7 @@ and save.
 ## How it decides
 
 `ReconnectEngine` is plain Kotlin with no Android imports, so every rule is
-unit-tested (`./gradlew testDebugUnitTest`, 38 tests). Each tick:
+unit-tested (`./gradlew testDebugUnitTest`, 59 tests). Each tick:
 
 | World state | Action |
 | --- | --- |
@@ -150,6 +150,62 @@ Bluetooth and hotspot retries keep separate budgets, so hotspot attempts backing
 off to five minutes never delay a fresh trigger after the link drops. Both reset
 as soon as the link comes up or the hotspot is joined, so a fresh attempt always
 starts at the short delay.
+
+## External control (Tasker, adb, other automation)
+
+The app exposes a small, documented control surface so another automation can
+switch iPhones without opening the UI. Commands are broadcast to
+`.receiver.ControlReceiver`; **explicit** broadcasts are recommended because
+Android does not reliably deliver implicit broadcasts to manifest receivers in
+the background:
+
+```sh
+adb shell am broadcast -n com.kaovilai.hotspotrelay/.receiver.ControlReceiver \
+  -a com.kaovilai.hotspotrelay.action.SET_ENABLED \
+  --es ssid "Work iPhone" --ez enabled false
+```
+
+| Action | Extras | Effect |
+| --- | --- | --- |
+| `…action.SET_ENABLED` | `id` \| `ssid` \| `label` \| `index`, `enabled` (bool, required) | Enable/disable one iPhone; its Wi-Fi suggestion is registered or removed to match |
+| `…action.MOVE` | selector, `to` (0-based) or `delta` (+1/−1) | Reorder one iPhone; `delta` moves it relative to its position |
+| `…action.SET_ORDER` | `order` = comma-separated SSIDs/labels/ids | Full reorder; unlisted entries are appended. Every listed entry must match (id > ssid > label), otherwise the command is rejected and nothing changes |
+| `…action.SET_ROTATE_AFTER` | `value` (1–10) | Rotation limit; `1` = round-robin |
+| `…action.START` / `…action.STOP` | — | Start/stop the loop |
+| `…action.QUERY` | — | No change; returns the current state |
+
+Rules:
+
+- Exactly one selector extra is needed (`id` > `ssid` > `label` > `index`).
+- Malformed commands are rejected with `ok=false`: a missing `enabled`, a
+  non-boolean `enabled`, a non-numeric `to`/`delta`/`index`/`value`, or `MOVE`
+  without either `to` or `delta`. The app never guesses a default.
+- Every command answers with JSON in the ordered-broadcast result (`state`, `ok`,
+  `message`) and also emits `com.kaovilai.hotspotrelay.action.STATE_CHANGED`
+  with the same extras, so an automation can listen for the new state.
+- `START`/`STOP` settle asynchronously, so the immediate response is only the
+  request acknowledgement. The foreground service itself emits
+  `STATE_CHANGED` whenever the loop actually starts or stops — including a
+  start that Android refuses right after the acknowledgement — so listen for
+  that event when you need the final `running` value.
+- State JSON contains `running`, `rotateAfterAttempts`, and per-target
+  `index/id/label/name/selector/ssid/enabled/complete`. **Passwords are never
+  exposed, and commands cannot change credentials, SSIDs or Bluetooth
+  selectors** — that stays in the app UI.
+- `START` may be refused by Android when sent from the background
+  (foreground-service launch restriction); the response then has `ok=false` and
+  a message saying so.
+- The receiver is exported by necessity (Tasker cannot hold a signature
+  permission), so any app can toggle/reorder/start/stop. None of these actions
+  can read secrets or add networks.
+
+Tasker: *Send Intent* → Target **Broadcast Receiver**, Package
+`com.kaovilai.hotspotrelay`, Class
+`com.kaovilai.hotspotrelay.receiver.ControlReceiver`, Action
+`com.kaovilai.hotspotrelay.action.SET_ENABLED`, Extra `ssid:Work iPhone`,
+Extra `enabled:false:Boolean`. To react to changes, use an *Intent Received*
+event for `com.kaovilai.hotspotrelay.action.STATE_CHANGED` and read
+`%state`.
 
 ## Limitations worth knowing
 
