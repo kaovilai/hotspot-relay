@@ -107,6 +107,14 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     @Volatile
     private var enforcement: Runnable? = null
 
+    /**
+     * Serializes [enforcement] and its wake lock. The check runs on the main
+     * looper, but [disconnectTrigger] can cancel it from the service thread; a
+     * repost or teardown that interleaved with a cancel would survive it as an
+     * untracked loop holding no lock.
+     */
+    private val enforcementLock = Any()
+
     /** HID peers the stack currently reports as connected (main-thread callbacks). */
     private val connectedAddresses = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
@@ -486,63 +494,87 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
      * disconnect from a previous target must not disarm the check for the next.
      */
     private fun scheduleEnforcement() {
-        if (enforcement != null) return
-        acquireEnforcementWakeLock()
-        val check = object : Runnable {
-            override fun run() {
-                val now = SystemClock.elapsedRealtime()
-                val addresses = connectedAddresses.toList()
-                if (addresses.isEmpty()) {
-                    enforcement = null
-                    releaseEnforcementWakeLock()
-                    unregisterHid()
-                    return
-                }
-                val denied = addresses.filterNot { isPeerAllowed(it, now) }
-                if (denied.isNotEmpty()) {
-                    // Only a drop of the service's own target is reported as a
-                    // policy drop; a stray remembered peer must not make the
-                    // engine keep the target's backoff.
-                    pendingDisconnectAddresses = denied
-                    if (hidTargetAddress in denied) {
-                        policyDrop.set(true)
-                    }
-                    denied.forEach { address ->
-                        val device = runCatching { adapter?.getRemoteDevice(address) }
-                            .getOrNull() ?: return@forEach
-                        dropLink(device)
-                    }
-                    // disconnect()/unregisterApp() only report command submission.
-                    // Peers still connected stay tracked so the check keeps running
-                    // instead of leaving an attached keyboard with no enforcement.
-                    val stillConnected = denied.filter { isLiveConnected(it) }
-                    connectedAddresses.clear()
-                    (addresses - denied).forEach { connectedAddresses.add(it) }
-                    stillConnected.forEach { connectedAddresses.add(it) }
-                    if (stillConnected.isNotEmpty()) {
-                        mainHandler.postDelayed(this, HidConnectionPolicy.MIN_CHECK_INTERVAL_MS)
+        synchronized(enforcementLock) {
+            if (enforcement != null) return
+            acquireEnforcementWakeLock()
+            val check = object : Runnable {
+                override fun run() {
+                    val now = SystemClock.elapsedRealtime()
+                    val addresses = connectedAddresses.toList()
+                    if (addresses.isEmpty()) {
+                        finishEnforcement(this)
+                        unregisterHid()
                         return
                     }
-                }
-                if (connectedAddresses.isEmpty()) {
-                    enforcement = null
-                    releaseEnforcementWakeLock()
-                } else {
-                    mainHandler.postDelayed(
-                        this,
-                        HidConnectionPolicy.nextCheckDelayMs(now, allowedUntilMs),
-                    )
+                    val denied = addresses.filterNot { isPeerAllowed(it, now) }
+                    if (denied.isNotEmpty()) {
+                        // Only a drop of the service's own target is reported as a
+                        // policy drop; a stray remembered peer must not make the
+                        // engine keep the target's backoff.
+                        pendingDisconnectAddresses = denied
+                        if (hidTargetAddress in denied) {
+                            policyDrop.set(true)
+                        }
+                        denied.forEach { address ->
+                            val device = runCatching { adapter?.getRemoteDevice(address) }
+                                .getOrNull() ?: return@forEach
+                            dropLink(device)
+                        }
+                        // disconnect()/unregisterApp() only report command submission.
+                        // Peers still connected stay tracked so the check keeps running
+                        // instead of leaving an attached keyboard with no enforcement.
+                        val stillConnected = denied.filter { isLiveConnected(it) }
+                        connectedAddresses.clear()
+                        (addresses - denied).forEach { connectedAddresses.add(it) }
+                        stillConnected.forEach { connectedAddresses.add(it) }
+                        if (stillConnected.isNotEmpty()) {
+                            repostEnforcement(this, HidConnectionPolicy.MIN_CHECK_INTERVAL_MS)
+                            return
+                        }
+                    }
+                    if (connectedAddresses.isEmpty()) {
+                        finishEnforcement(this)
+                    } else {
+                        repostEnforcement(
+                            this,
+                            HidConnectionPolicy.nextCheckDelayMs(now, allowedUntilMs),
+                        )
+                    }
                 }
             }
+            enforcement = check
+            mainHandler.postDelayed(check, HidConnectionPolicy.GRACE_MS)
         }
-        enforcement = check
-        mainHandler.postDelayed(check, HidConnectionPolicy.GRACE_MS)
     }
 
     private fun cancelEnforcement() {
-        enforcement?.let { mainHandler.removeCallbacks(it) }
-        enforcement = null
-        releaseEnforcementWakeLock()
+        synchronized(enforcementLock) {
+            enforcement?.let { mainHandler.removeCallbacks(it) }
+            enforcement = null
+            releaseEnforcementWakeLock()
+        }
+    }
+
+    /**
+     * Re-arms [check] only while it is still the tracked runnable. A cancel from
+     * the service thread may land while the check is mid-run (it is not queued
+     * then, so `removeCallbacks` cannot reach it); posting under the same lock
+     * means the cancel either wins and nothing is reposted, or removes the post.
+     */
+    private fun repostEnforcement(check: Runnable, delayMs: Long) {
+        synchronized(enforcementLock) {
+            if (enforcement !== check) return
+            mainHandler.postDelayed(check, delayMs)
+        }
+    }
+
+    /** Ends [check] only if a cancel/new session has not already replaced it. */
+    private fun finishEnforcement(check: Runnable) {
+        synchronized(enforcementLock) {
+            if (enforcement !== check) return
+            enforcement = null
+            releaseEnforcementWakeLock()
+        }
     }
 
     /**
