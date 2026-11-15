@@ -25,9 +25,11 @@ import com.kaovilai.hotspotrelay.core.TargetRotation
 import com.kaovilai.hotspotrelay.core.WorldSnapshot
 import com.kaovilai.hotspotrelay.data.AppSettings
 import com.kaovilai.hotspotrelay.data.IphoneTarget
+import com.kaovilai.hotspotrelay.data.SettingsStateJson
 import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.platform.AndroidBluetoothLink
 import com.kaovilai.hotspotrelay.platform.AndroidWifiLink
+import com.kaovilai.hotspotrelay.receiver.ControlReceiver
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -372,7 +374,28 @@ class ReconnectService : Service() {
     }
 
     private fun publish(status: ServiceStatus) {
+        val wasRunning = _status.value.running
         _status.value = status
+        if (wasRunning != status.running) broadcastRunningState(status.running)
+    }
+
+    /**
+     * External automation (Tasker, adb) listens for STATE_CHANGED. Emit it when
+     * the loop actually starts or stops — including a foreground start that is
+     * refused right after the command returned — so a START/STOP command never
+     * leaves listeners on the pre-transition `running` value. Routine ticks do
+     * not broadcast.
+     */
+    private fun broadcastRunningState(running: Boolean) {
+        runCatching {
+            val state = SettingsStateJson.encode(SettingsStore.get(this).settings.value, running)
+            sendBroadcast(
+                Intent(ControlReceiver.ACTION_STATE_CHANGED)
+                    .putExtra("ok", true)
+                    .putExtra("message", if (running) "service started" else "service stopped")
+                    .putExtra("state", state),
+            )
+        }.onFailure { Log.w(TAG, "cannot broadcast running state", it) }
     }
 
     companion object {

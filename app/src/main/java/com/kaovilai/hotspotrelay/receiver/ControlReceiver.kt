@@ -14,11 +14,6 @@ import com.kaovilai.hotspotrelay.data.SettingsStateJson
 import com.kaovilai.hotspotrelay.data.SettingsStore
 import com.kaovilai.hotspotrelay.platform.SuggestionSync
 import com.kaovilai.hotspotrelay.service.ReconnectService
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * External control surface for Tasker, adb and other automation.
@@ -87,47 +82,10 @@ class ControlReceiver : BroadcastReceiver() {
         }
 
         respond(context, after, ok, message)
-
-        // START/STOP settle asynchronously, so the snapshot above can still show
-        // the previous `running` value. Publish the settled state as a second
-        // STATE_CHANGED once the service actually flips, so listeners need not
-        // poll.
-        if (outcome.serviceAction != null) {
-            publishSettledState(context, ok, message, wantRunning = outcome.serviceAction == CommandOutcome.ServiceAction.START)
-        }
-    }
-
-    /**
-     * Broadcasts the state again after the service reaches [wantRunning] (or the
-     * timeout passes), using [goAsync] so the receiver is not killed first.
-     */
-    private fun publishSettledState(
-        context: Context,
-        ok: Boolean,
-        message: String,
-        wantRunning: Boolean,
-    ) {
-        val pending = goAsync()
-        val appContext = context.applicationContext
-        CoroutineScope(Dispatchers.Default).launch {
-            try {
-                withTimeoutOrNull(SERVICE_SETTLE_TIMEOUT_MS) {
-                    ReconnectService.status.first { it.running == wantRunning }
-                }
-                val state = SettingsStateJson.encode(
-                    settings = SettingsStore.get(appContext).settings.value,
-                    running = ReconnectService.status.value.running,
-                )
-                appContext.sendBroadcast(
-                    Intent(ACTION_STATE_CHANGED)
-                        .putExtra("ok", ok)
-                        .putExtra("message", message)
-                        .putExtra("state", state),
-                )
-            } finally {
-                pending.finish()
-            }
-        }
+        // START/STOP settle asynchronously, so the snapshot above is only the
+        // request acknowledgement. ReconnectService broadcasts its own
+        // STATE_CHANGED whenever `running` flips, including the case where a
+        // foreground start is refused after this handler returned.
     }
 
     private data class Parsed(val command: SettingsCommand? = null, val error: String? = null)
@@ -273,9 +231,6 @@ class ControlReceiver : BroadcastReceiver() {
     companion object {
         private const val TAG = "HotspotRelay/Control"
         private const val ACTION_PREFIX = "com.kaovilai.hotspotrelay.action."
-
-        /** How long a START/STOP waits for the service to settle before reporting. */
-        private const val SERVICE_SETTLE_TIMEOUT_MS = 5_000L
 
         const val ACTION_STATE_CHANGED = ACTION_PREFIX + "STATE_CHANGED"
         const val ACTION_QUERY = ACTION_PREFIX + "QUERY"

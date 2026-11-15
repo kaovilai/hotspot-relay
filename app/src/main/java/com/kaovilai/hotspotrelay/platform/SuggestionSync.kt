@@ -25,10 +25,23 @@ object SuggestionSync {
             .toSet()
             .forEach { ssid -> runCatching { wifi.forgetSuggestion(ssid) } }
 
-        active.forEach { target ->
-            runCatching { wifi.ensureSuggestion(target.ssid, target.password) }
-                .onFailure { Log.w(TAG, "could not register ${target.ssid}", it) }
-        }
+        // ensureSuggestion() removes an existing suggestion before adding it again,
+        // which can drop a shared or currently-joined hotspot. Only (re)register
+        // entries that were not already active with the same credentials — a new,
+        // re-enabled or password-changed target — so a priority-only change (MOVE,
+        // SET_ORDER) or disabling one target leaves every other suggestion alone.
+        val alreadyActive = before.targets.filter { it.enabled && it.isComplete }
+            .map { it.ssid to it.password }
+            .toSet()
+        active.distinctBy { it.ssid }
+            .filter { (it.ssid to it.password) !in alreadyActive }
+            .forEach { target ->
+                val outcome = runCatching { wifi.ensureSuggestion(target.ssid, target.password) }
+                    .getOrNull()
+                if (outcome == null || outcome == SuggestionOutcome.REJECTED || outcome == SuggestionOutcome.ERROR) {
+                    Log.w(TAG, "could not register a suggestion for ${target.ssid}: $outcome")
+                }
+            }
     }
 
     private const val TAG = "HotspotRelay/Wifi"

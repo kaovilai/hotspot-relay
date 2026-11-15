@@ -95,8 +95,10 @@ fun SettingsScreen(store: SettingsStore) {
         autoStartOnBoot != synced.autoStartOnBoot
 
     // Settings can also change from the external control receiver (Tasker, adb);
-    // reflect those, but never clobber in-progress edits.
-    LaunchedEffect(saved) {
+    // reflect those, but never clobber in-progress edits. `dirty` is a key so an
+    // external change that arrived while the form was edited is still adopted
+    // once the edits are reverted (saved does not change again in that case).
+    LaunchedEffect(saved, dirty) {
         val untouched = rows == synced.targets &&
             rotateAfter == synced.rotateAfterAttempts.toString() &&
             tickSeconds == (synced.tickIntervalMs / 1000).toString() &&

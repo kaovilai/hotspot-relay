@@ -183,10 +183,11 @@ Rules:
 - Every command answers with JSON in the ordered-broadcast result (`state`, `ok`,
   `message`) and also emits `com.kaovilai.hotspotrelay.action.STATE_CHANGED`
   with the same extras, so an automation can listen for the new state.
-- `START`/`STOP` settle asynchronously, so they emit a **second** `STATE_CHANGED`
-  once the service has actually started or stopped (immediately if it was
-  already in the requested state, at most ~5 s otherwise). Wait for that one
-  when you need the final `running` value.
+- `START`/`STOP` settle asynchronously, so the immediate response is only the
+  request acknowledgement. The foreground service itself emits
+  `STATE_CHANGED` whenever the loop actually starts or stops — including a
+  start that Android refuses right after the acknowledgement — so listen for
+  that event when you need the final `running` value.
 - State JSON contains `running`, `rotateAfterAttempts`, and per-target
   `index/id/label/name/selector/ssid/enabled/complete`. **Passwords are never
   exposed, and commands cannot change credentials, SSIDs or Bluetooth
