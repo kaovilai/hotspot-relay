@@ -240,9 +240,12 @@ event for `com.kaovilai.hotspotrelay.action.STATE_CHANGED` and read
   never allowed to outlive its trigger window: it is dropped as soon as the
   hotspot is joined, right after a pairing completes, and at the latest about a
   minute after the last attempt (a background check enforces this even if no
-  further Bluetooth event arrives). An unsolicited re-connect of the remembered
-  keyboard is dropped within seconds. The **bond is kept**, so the next trigger
-  connects without re-pairing.
+  further Bluetooth event arrives, and a partial wakelock is held only while
+  that check is pending, so it also fires with the screen off). An unsolicited
+  re-connect of the remembered keyboard is dropped within seconds. After a
+  window drop the loop backs off (15 s → 300 s) instead of re-arming right away,
+  so a failing trigger does not keep the keyboard attached in a loop. The
+  **bond is kept**, so the next trigger connects without re-pairing.
 - **Why a keyboard and not a mouse.** A HID mouse would sidestep the iPhone's
   keyboard suppression, but classic-Bluetooth mouse support on iOS is only
   available through AssistiveTouch and is not verified here; a keyboard is the

@@ -20,6 +20,7 @@ class ReconnectEngineTest {
         targetSsid: String = ssid,
         wifiAssociated: Boolean = connectedSsid != null,
         hotspotRequestSatisfied: Boolean = false,
+        linkDroppedByPolicy: Boolean = false,
     ) = WorldSnapshot(
         nowMs = nowMs,
         configured = configured,
@@ -31,7 +32,40 @@ class ReconnectEngineTest {
         connectedSsid = connectedSsid,
         wifiAssociated = wifiAssociated,
         hotspotRequestSatisfied = hotspotRequestSatisfied,
+        linkDroppedByPolicy = linkDroppedByPolicy,
     )
+
+    @Test
+    fun `policy drop waits out the bluetooth backoff before re-arming`() {
+        val engine = ReconnectEngine()
+
+        engine.onTick(snapshot(nowMs = 0, iphoneLink = LinkStatus.CONNECTED))
+        engine.onTick(
+            snapshot(nowMs = 10_000, iphoneLink = LinkStatus.CONNECTED, linkDroppedByPolicy = true),
+        )
+
+        assertEquals(EngineAction.Idle, engine.onTick(snapshot(nowMs = 10_001)))
+        assertEquals(25_000L, engine.state().nextAttemptAtMs ?: -1L)
+    }
+
+    @Test
+    fun `re-arming after a policy drop keeps the accumulated backoff`() {
+        val engine = ReconnectEngine()
+
+        engine.onTick(snapshot(nowMs = 0, iphoneLink = LinkStatus.CONNECTED))
+        // Grace period over: the hotspot is requested and its retry budget grows.
+        assertEquals(
+            EngineAction.ConnectHotspot,
+            engine.onTick(snapshot(nowMs = 9_000, iphoneLink = LinkStatus.CONNECTED)),
+        )
+        engine.onTick(
+            snapshot(nowMs = 10_000, iphoneLink = LinkStatus.CONNECTED, linkDroppedByPolicy = true),
+        )
+        // Backoff paid, link re-armed: this is a retry, not a fresh trigger.
+        engine.onTick(snapshot(nowMs = 26_000, iphoneLink = LinkStatus.CONNECTED))
+
+        assertTrue(engine.state().failures >= 1)
+    }
 
     @Test
     fun `already on the hotspot does nothing`() {

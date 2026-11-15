@@ -14,6 +14,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -96,7 +97,19 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     private var pairingMode = false
 
     private var bondReceiver: BroadcastReceiver? = null
+
+    @Volatile
     private var enforcement: Runnable? = null
+
+    /** HID peers the stack currently reports as connected (main-thread callbacks). */
+    private val connectedAddresses = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    /** Keeps the CPU awake only while an enforcement check is pending. */
+    private var enforcementWakeLock: PowerManager.WakeLock? = null
+
+    /** Set when enforcement dropped a link on purpose (not an iPhone-side drop). */
+    @Volatile
+    private var policyDrop = false
 
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
@@ -117,8 +130,12 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             // pairing there is no configured selector, and the iPhone's own
             // reconnect of a remembered keyboard must never linger either.
             when (state) {
-                BluetoothProfile.STATE_CONNECTED -> scheduleEnforcement(device)
-                BluetoothProfile.STATE_DISCONNECTED -> cancelEnforcement()
+                BluetoothProfile.STATE_CONNECTED -> {
+                    connectedAddresses.add(device.address)
+                    scheduleEnforcement()
+                }
+
+                BluetoothProfile.STATE_DISCONNECTED -> connectedAddresses.remove(device.address)
             }
         }
     }
@@ -152,6 +169,7 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
         stopped = true
         endPairingMode()
         allowedUntilMs = 0
+        connectedAddresses.clear()
         unregisterHid()
         val hid = hidDevice
         if (hid != null) {
@@ -269,6 +287,10 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             HidConnectionPolicy.PAIRING_WINDOW_MS,
         )
         watchBondState()
+        // Every pairing session expires, including the NOT_READY tap the user
+        // never retries; otherwise the bond receiver and pairing state would leak.
+        mainHandler.removeCallbacks(pairingTimeout)
+        mainHandler.postDelayed(pairingTimeout, PAIRING_REGISTRATION_TTL_MS)
 
         start()
         val hid = hidDevice ?: return PairingModeResult.NOT_READY
@@ -277,11 +299,6 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
             // Registration lands in onAppStatusChanged; the caller retries.
             return PairingModeResult.NOT_READY
         }
-        // Backstop only: the bond-state receiver ends pairing mode as soon as the
-        // iPhone actually pairs, so the keyboard is not left attached for the
-        // whole discoverability window.
-        mainHandler.removeCallbacks(pairingTimeout)
-        mainHandler.postDelayed(pairingTimeout, PAIRING_REGISTRATION_TTL_MS)
         return PairingModeResult.READY
     }
 
@@ -345,9 +362,12 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
                 }
                 if (!hidRegistered) registerHid(hid)
                 if (!connectRequested) {
-                    connectRequested = true
-                    runCatching { hid.connect(device) }
+                    // connect() returns false when the command was not sent (e.g.
+                    // registration still settling); retry within the budget
+                    // instead of failing the probe on one rejected call.
+                    connectRequested = runCatching { hid.connect(device) }
                         .onFailure { Log.w(TAG, "probe HID connect failed", it) }
+                        .getOrDefault(false)
                 }
 
                 val state = runCatching { hid.getConnectionState(device) }
@@ -375,19 +395,40 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     }
 
     /**
-     * Re-checks the allowed window while a link is up. Every attempt extends the
-     * window; once it has passed (plus a short grace) the link is dropped and the
-     * HID app unregistered, so no keyboard can stay attached.
+     * Re-checks the allowed window while any HID peer is connected. Every attempt
+     * extends the window; once it has passed (plus a short grace) every connected
+     * peer is dropped and the HID app unregistered, so no keyboard can stay
+     * attached. Keyed by the connected set, never by one device: a delayed
+     * disconnect from a previous target must not disarm the check for the next.
      */
-    private fun scheduleEnforcement(device: BluetoothDevice) {
-        cancelEnforcement()
+    private fun scheduleEnforcement() {
+        if (enforcement != null) return
+        acquireEnforcementWakeLock()
         val check = object : Runnable {
             override fun run() {
                 val now = SystemClock.elapsedRealtime()
                 if (!HidConnectionPolicy.isAllowed(now, allowedUntilMs)) {
-                    Log.i(TAG, "dropping HID link: trigger window expired")
+                    val addresses = connectedAddresses.toList()
+                    connectedAddresses.clear()
                     enforcement = null
-                    dropLink(device)
+                    releaseEnforcementWakeLock()
+                    if (addresses.isEmpty()) {
+                        unregisterHid()
+                        return
+                    }
+                    Log.i(TAG, "dropping HID link: trigger window expired")
+                    // Tell the service this was our own window, not a link failure:
+                    // otherwise the engine resets its backoff and re-arms the
+                    // keyboard on the very next tick.
+                    policyDrop = true
+                    addresses.forEach { address ->
+                        val device = runCatching { adapter?.getRemoteDevice(address) }
+                            .getOrNull() ?: return@forEach
+                        dropLink(device)
+                    }
+                } else if (connectedAddresses.isEmpty()) {
+                    enforcement = null
+                    releaseEnforcementWakeLock()
                 } else {
                     mainHandler.postDelayed(
                         this,
@@ -403,6 +444,40 @@ class AndroidBluetoothLink private constructor(private val context: Context) {
     private fun cancelEnforcement() {
         enforcement?.let { mainHandler.removeCallbacks(it) }
         enforcement = null
+        releaseEnforcementWakeLock()
+    }
+
+    /**
+     * Handler delays do not advance while the device is suspended, so keep the CPU
+     * awake for the (bounded) lifetime of a pending window check. The lock covers
+     * the longest window plus grace; it is released as soon as the check ends.
+     */
+    private fun acquireEnforcementWakeLock() {
+        if (enforcementWakeLock != null) return
+        val power = context.getSystemService(PowerManager::class.java) ?: return
+        val lock = runCatching {
+            power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HotspotRelay:hid-window")
+        }.getOrNull() ?: return
+        runCatching { lock.acquire(HidConnectionPolicy.ENFORCEMENT_WAKE_LOCK_MS) }
+        enforcementWakeLock = lock
+    }
+
+    private fun releaseEnforcementWakeLock() {
+        enforcementWakeLock?.let { lock ->
+            runCatching { if (lock.isHeld) lock.release() }
+        }
+        enforcementWakeLock = null
+    }
+
+    /**
+     * True once if the last dropped link was dropped by our own window check.
+     * The service uses this to keep its retry backoff instead of treating it as
+     * the iPhone going away.
+     */
+    fun consumeLinkDroppedByPolicy(): Boolean {
+        val dropped = policyDrop
+        policyDrop = false
+        return dropped
     }
 
     private fun dropLink(device: BluetoothDevice) {

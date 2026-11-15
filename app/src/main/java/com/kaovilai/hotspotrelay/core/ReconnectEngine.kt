@@ -30,6 +30,11 @@ data class WorldSnapshot(
     val wifiAssociated: Boolean = connectedSsid != null,
     /** True when an app-scoped request to the hotspot recently came up. */
     val hotspotRequestSatisfied: Boolean = false,
+    /**
+     * The link was dropped by our own HID window expiry since the last tick, not
+     * by the iPhone going away. Treated as "no link" without resetting backoff.
+     */
+    val linkDroppedByPolicy: Boolean = false,
 )
 
 sealed interface EngineAction {
@@ -122,6 +127,9 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
     private var blockedReason: BlockReason? = null
     private var connectedSinceMs: Long? = null
     private var lastLink: LinkStatus? = null
+
+    /** The previous drop was our own HID window, not an iPhone-side disconnect. */
+    private var lastDropWasPolicy = false
     private var linkConnectedAtMs: Long? = null
     private var connectingSinceMs: Long? = null
 
@@ -144,6 +152,7 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
         blockedReason = null
         connectedSinceMs = null
         lastLink = null
+        lastDropWasPolicy = false
         linkConnectedAtMs = null
     }
 
@@ -206,15 +215,36 @@ class ReconnectEngine(private val policy: RetryPolicy = RetryPolicy()) {
     }
 
     private fun trackLink(snapshot: WorldSnapshot) {
+        if (snapshot.linkDroppedByPolicy) {
+            // Our own window drop: keep the retry backoff so a broken trigger
+            // (shortcut off, wrong password) is not re-armed every few seconds,
+            // which would keep the iPhone keyboard hidden most of the time. The
+            // first backoff step is paid immediately, and the next connect keeps
+            // the accumulated budgets instead of treating itself as a fresh
+            // trigger.
+            lastLink = LinkStatus.DISCONNECTED
+            lastDropWasPolicy = true
+            linkConnectedAtMs = null
+            connectingSinceMs = null
+            btFailures = btFailures.coerceAtLeast(1)
+            nextBtAttemptAtMs = snapshot.nowMs + policy.delayFor(btFailures)
+            return
+        }
         val previous = lastLink
         lastLink = snapshot.iphoneLink
         when {
             snapshot.iphoneLink == LinkStatus.CONNECTED && previous != LinkStatus.CONNECTED -> {
                 // Fresh link: the iPhone shortcut has not run yet, and both retry
-                // budgets start over.
+                // budgets start over — unless the previous link was dropped by our
+                // own HID window, in which case this is a retry of a trigger that
+                // has been failing and its backoff must survive.
                 linkConnectedAtMs = snapshot.nowMs
                 connectingSinceMs = null
-                clearRetries()
+                if (lastDropWasPolicy) {
+                    lastDropWasPolicy = false
+                } else {
+                    clearRetries()
+                }
             }
 
             snapshot.iphoneLink == LinkStatus.DISCONNECTED && previous == LinkStatus.CONNECTED -> {
