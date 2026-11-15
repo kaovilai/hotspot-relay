@@ -136,8 +136,9 @@ fun SettingsScreen(store: SettingsStore) {
         }
         // Keep Android's suggestions in sync: a deleted, cleared or disabled
         // entry must stop being auto-joined, and edited credentials must be
-        // re-registered or the system keeps using the old password.
-        SuggestionSync.reconcile(context, saved, stored)
+        // re-registered or the system keeps using the old password. Retry any
+        // registration that failed earlier, even when nothing changed now.
+        SuggestionSync.reconcile(context, saved, stored, retryMissing = true)
 
         synced = stored
         rows = stored.targets
@@ -285,7 +286,10 @@ fun SettingsScreen(store: SettingsStore) {
                         ).show()
                         return@FilledTonalButton
                     }
-                    val results = complete.map { it to wifi.ensureSuggestion(it.ssid, it.password) }
+                    // One suggestion per SSID: keep the highest-priority target,
+                    // matching what the reconnect loop and SuggestionSync use.
+                    val unique = complete.distinctBy { it.ssid }
+                    val results = unique.map { it to wifi.ensureSuggestion(it.ssid, it.password) }
                     val failed = results
                         .filter { (_, outcome) ->
                             outcome == SuggestionOutcome.ERROR || outcome == SuggestionOutcome.REJECTED

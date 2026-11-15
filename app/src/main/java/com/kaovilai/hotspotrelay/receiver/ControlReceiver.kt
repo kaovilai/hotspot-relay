@@ -133,7 +133,12 @@ class ControlReceiver : BroadcastReceiver() {
                             ?: return Parsed(error = "MOVE 'delta' must be a number")
                         val index = SettingsCommands.resolveIndex(settings.targets, selector)
                             ?: return Parsed(error = "MOVE found no target for that selector")
-                        Parsed(SettingsCommand.Move(selector, index + delta))
+                        // Add in Long so a huge delta cannot wrap into a negative
+                        // index; Move clamps the result to the real range.
+                        val destination = (index.toLong() + delta)
+                            .coerceIn(Int.MIN_VALUE.toLong(), Int.MAX_VALUE.toLong())
+                            .toInt()
+                        Parsed(SettingsCommand.Move(selector, destination))
                     }
 
                     else -> Parsed(error = "MOVE needs 'to' or 'delta'")

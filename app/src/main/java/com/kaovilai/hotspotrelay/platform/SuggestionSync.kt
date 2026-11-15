@@ -18,9 +18,20 @@ import com.kaovilai.hotspotrelay.data.AppSettings
  */
 object SuggestionSync {
 
-    fun reconcile(context: Context, before: AppSettings, after: AppSettings) {
+    /**
+     * Applies the diff. With [retryMissing], every currently active target is also
+     * `ensure`d even if the settings did not change: a previous registration may
+     * have failed, and Save/Start would otherwise never retry it because the
+     * before/after targets are identical.
+     */
+    fun reconcile(
+        context: Context,
+        before: AppSettings,
+        after: AppSettings,
+        retryMissing: Boolean = false,
+    ) {
         val plan = SuggestionPlanner.plan(before, after)
-        if (plan.isEmpty) return
+        if (plan.isEmpty && !retryMissing) return
         val wifi = AndroidWifiLink(context)
 
         plan.forget.forEach { target ->
@@ -30,11 +41,18 @@ object SuggestionSync {
         plan.register.forEach { target ->
             register(wifi, target.ssid, target.password, replaceExisting = true)
         }
+
+        val ensure = if (retryMissing) {
+            (plan.ensure + after.targets.filter { it.enabled && it.isComplete })
+                .distinctBy { it.ssid }
+        } else {
+            plan.ensure
+        }
         // API 29 cannot enumerate suggestions, so "ensure" would remove and
         // re-add an identical entry there; on 30+ it is a true no-op when the
         // suggestion exists and repairs it when an earlier add failed.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            plan.ensure.forEach { target ->
+            ensure.forEach { target ->
                 register(wifi, target.ssid, target.password, replaceExisting = false)
             }
         }
