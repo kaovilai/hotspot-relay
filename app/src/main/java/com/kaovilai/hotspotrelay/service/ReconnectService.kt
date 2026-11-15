@@ -172,7 +172,10 @@ class ReconnectService : Service() {
         // Bluetooth retry right after the link drops.
         if (state.phase in RELEASE_TRIGGER_PHASES && lastPhase !in RELEASE_TRIGGER_PHASES) {
             bluetooth.disconnectTrigger()
-            wifi.cancelHotspotRequests()
+            // Keep the request alive on CONNECTED: its 30s hold is what hands the
+            // association over to the system's own auto-join. Cancel it only when
+            // we stop caring (other Wi-Fi) or cannot proceed (blocked).
+            if (state.phase != Phase.CONNECTED) wifi.cancelHotspotRequests()
         }
         lastPhase = state.phase
     }
